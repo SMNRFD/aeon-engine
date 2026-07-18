@@ -142,6 +142,14 @@ class SpellCaster:
         self.status = status_system or StatusEffectSystem()
         self.rng = rng or RNG()
 
+    def _entity_name(self, world: World, entity: Entity) -> str:
+        """Get an entity's display name, falling back to its ID."""
+        from engine.entities.components import Identity as IdentityComp
+        identity = world.get_component(entity, IdentityComp)
+        if identity and identity.display_name:
+            return identity.display_name
+        return f"entity#{entity.id}"
+
     def cast(self, world: World, caster: Entity, spell: Spell,
              target: Optional[Entity] = None) -> SpellCastResult:
         # Check mana
@@ -213,7 +221,7 @@ class SpellCaster:
 
         return SpellCastResult(
             success=True,
-            message=f"{caster.id} casts {spell.name}!",
+            message=f"{self._entity_name(world, caster)} casts {spell.name}!",
             mana_spent=spell.mana_cost,
             damage_dealt=damage_total,
             healing_done=heal_total,

@@ -108,7 +108,7 @@ class CombatSystem:
             return AttackResult(
                 attacker=attacker.id, target=target.id, hit=False, damage=0.0,
                 damage_type=DamageType.TRUE, crit=False, killed=False,
-                message=f"{attacker.id} misses {target.id}.",
+                message=f"{self._entity_name(world, attacker)} misses {self._entity_name(world, target)}.",
             )
 
         # Roll block
@@ -116,7 +116,7 @@ class CombatSystem:
             return AttackResult(
                 attacker=attacker.id, target=target.id, hit=True, damage=0.0,
                 damage_type=DamageType.TRUE, crit=False, killed=False,
-                message=f"{target.id} blocks the attack!",
+                message=f"{self._entity_name(world, target)} blocks the attack!",
             )
 
         # Roll crit
@@ -179,12 +179,17 @@ class CombatSystem:
 
         killed = tgt_health.current <= 0
 
-        # Build message
-        msg = f"{attacker.id} hits {target.id} for {final_damage:.0f} {damage_type.value} damage"
+        # Build message — use entity names instead of IDs
+        from engine.entities.components import Identity as IdentityComp
+        atk_identity = world.get_component(attacker, IdentityComp)
+        tgt_identity = world.get_component(target, IdentityComp)
+        atk_name = atk_identity.display_name if atk_identity else f"entity#{attacker.id}"
+        tgt_name = tgt_identity.display_name if tgt_identity else f"entity#{target.id}"
+        msg = f"{atk_name} hits {tgt_name} for {final_damage:.0f} {damage_type.value} damage"
         if is_crit:
             msg += " (CRITICAL!)"
         if killed:
-            msg += f" — {target.id} is slain!"
+            msg += f" — {tgt_name} is slain!"
 
         return AttackResult(
             attacker=attacker.id, target=target.id, hit=True,
@@ -234,6 +239,14 @@ class CombatSystem:
         return result
 
     # ---------- helpers ----------
+
+    def _entity_name(self, world: World, entity: Entity) -> str:
+        """Get an entity's display name, falling back to its ID."""
+        from engine.entities.components import Identity as IdentityComp
+        identity = world.get_component(entity, IdentityComp)
+        if identity and identity.display_name:
+            return identity.display_name
+        return f"entity#{entity.id}"
 
     def _get_equipped_weapon(self, world: World, entity: Entity):
         if self.items is None:

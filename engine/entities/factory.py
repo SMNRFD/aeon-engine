@@ -25,8 +25,8 @@ class EntityFactory:
         e = self.world.create_entity()
         self.world.add_component(e, Identity(name=name, glyph="@", color=255))
         self.world.add_component(e, Position(x=0, y=0))
-        self.world.add_component(e, Health(current=120, maximum=120, regeneration=0.5))
-        self.world.add_component(e, Stats(strength=14, agility=14, endurance=12,
+        self.world.add_component(e, Health(current=200, maximum=200, regeneration=1.0))
+        self.world.add_component(e, Stats(strength=16, agility=14, endurance=14,
                                           intelligence=12, willpower=12,
                                           charisma=12, perception=14, luck=10))
         self.world.add_component(e, Needs())

@@ -12,6 +12,8 @@ Options:
     --load NAME     Load a save slot instead of starting a new game.
     --no-plugins    Skip plugin loading.
     --debug         Enable debug/cheat mode.
+    --repl          Use the new interactive REPL (default).
+    --old-ui        Use the old terminal renderer.
     --help          Show this help.
 """
 
@@ -40,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-plugins", action="store_true", help="Skip plugin loading.")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
     parser.add_argument("--name", type=str, default="Hero", help="Player character name.")
+    parser.add_argument("--old-ui", action="store_true",
+                        help="Use the old terminal renderer instead of the new REPL.")
+    parser.add_argument("--repl", action="store_true", default=True,
+                        help="Use the new interactive REPL (default).")
     return parser.parse_args()
 
 
@@ -59,7 +65,10 @@ def main() -> int:
     log = get_logger("main")
     log.info("Starting Aeon Engine v%s", config.version)
 
-    engine = Engine(config, headless=args.headless)
+    engine = Engine(config, headless=args.headless or (not args.old_ui and not args.headless))
+    # The REPL uses the engine in headless mode (no old renderer) and provides its own UI
+    if not args.old_ui and not args.headless:
+        engine.headless = True
     if args.no_plugins:
         engine.config.plugins.autoload_enabled = False
 
@@ -93,7 +102,34 @@ def main() -> int:
         return 0
 
     try:
-        engine.start()
+        if args.old_ui:
+            # Use the old terminal renderer
+            engine.headless = False
+            # Need to set up renderer and screens
+            from engine.render.terminal import TerminalRenderer
+            from engine.ui.screens import ScreenManager, MainScreen
+            engine.renderer = TerminalRenderer(
+                width=config.ui.viewport_width,
+                height=config.ui.viewport_height,
+                use_color=config.ui.color_enabled,
+            )
+            engine.screens = ScreenManager(engine.renderer, engine.i18n)
+            engine.screens.register_screen(MainScreen(engine.renderer, engine.i18n))
+            engine.start()
+        else:
+            # Use the new REPL
+            from engine.repl.repl import GameREPL
+            # Load plugins
+            if engine.config.plugins.autoload_enabled:
+                try:
+                    success, failure = engine.plugins.load_all()
+                    if success:
+                        engine.plugins.enable_all()
+                    log.info("Plugins loaded: %d success, %d failed", success, failure)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Plugin loading failed: %s", exc)
+            repl = GameREPL(engine)
+            repl.run()
     except KeyboardInterrupt:
         log.info("Interrupted by user")
     finally:

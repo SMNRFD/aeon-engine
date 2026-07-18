@@ -81,21 +81,29 @@ class WanderAI(AIController):
                     if d <= 1.5:
                         return AIAction(type="attack", target_entity=target.id,
                                         reasoning="attacking prey")
-                    else:
+                    elif d <= 6.0:
                         return AIAction(type="move",
                                         target_position=(t_pos.x, t_pos.y),
                                         reasoning="chasing prey")
-        # Look for hostile targets (entities tagged "player" or "humanoid")
+                    else:
+                        ai.target_id = None  # lost track
+        # Look for hostile targets — only attack player if very close (within 3 tiles)
         for other, dist in ctx.nearby_entities:
-            if dist > 8.0:
+            if dist > 3.0:
                 continue
             if ctx.world.has_tag(other, "player"):
                 if ai:
                     ai.target_id = other.id
-                return AIAction(type="attack", target_entity=other.id,
-                                reasoning="player nearby")
-        # Wander
-        if ctx.rng.chance(0.3):
+                # Attack only if adjacent
+                if dist <= 1.5:
+                    return AIAction(type="attack", target_entity=other.id,
+                                    reasoning="player adjacent")
+                else:
+                    return AIAction(type="move",
+                                    target_position=self._toward(ctx, other),
+                                    reasoning="approaching player")
+        # Wander occasionally
+        if ctx.rng.chance(0.2):
             my_pos = ctx.world.get_component(ctx.entity, Position)
             if my_pos:
                 dx, dy = ctx.rng.choice([(-1, 0), (1, 0), (0, -1), (0, 1),
@@ -105,6 +113,16 @@ class WanderAI(AIController):
                                 reasoning="wandering")
         return AIAction(type="wait", duration=0.5, reasoning="idling")
 
+    def _toward(self, ctx: AIContext, target: Entity) -> tuple[int, int]:
+        """Get a position one step toward the target."""
+        my_pos = ctx.world.get_component(ctx.entity, Position)
+        t_pos = ctx.world.get_component(target, Position)
+        if my_pos is None or t_pos is None:
+            return (0, 0)
+        dx = 1 if t_pos.x > my_pos.x else (-1 if t_pos.x < my_pos.x else 0)
+        dy = 1 if t_pos.y > my_pos.y else (-1 if t_pos.y < my_pos.y else 0)
+        return (my_pos.x + dx, my_pos.y + dy)
+
 
 class AggressiveAI(WanderAI):
     """Actively hunts hostiles within a wider range."""
@@ -113,16 +131,21 @@ class AggressiveAI(WanderAI):
 
     def decide(self, ctx: AIContext) -> AIAction:
         ai = ctx.world.get_component(ctx.entity, AIComponent)
-        # Check nearby for hostiles
+        # Check nearby for hostiles — within 6 tiles
         for other, dist in ctx.nearby_entities:
-            if dist > 12.0:
+            if dist > 6.0:
                 continue
             if ctx.world.has_tag(other, "player") or ctx.world.has_tag(other, "humanoid"):
                 if ai:
                     ai.target_id = other.id
                     ai.alertness = 1.0
-                return AIAction(type="attack", target_entity=other.id,
-                                reasoning="spotted enemy")
+                if dist <= 1.5:
+                    return AIAction(type="attack", target_entity=other.id,
+                                    reasoning="attacking enemy")
+                else:
+                    return AIAction(type="move",
+                                    target_position=self._toward(ctx, other),
+                                    reasoning="approaching enemy")
         return super().decide(ctx)
 
 

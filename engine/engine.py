@@ -221,7 +221,7 @@ class Engine:
             # Add a basic inventory
             self.inventories[npc.id] = Inventory(capacity=15, max_weight=30.0)
             self.spatial.insert(npc, tile.x, tile.y)
-        # Spawn some creatures
+        # Spawn some creatures — fewer, more balanced
         creature_types = [
             ("Wolf", "w", Color.GRAY, 25, 8, 12, True),
             ("Deer", "d", Color.BROWN, 18, 4, 14, False),
@@ -229,7 +229,9 @@ class Engine:
             ("Goblin", "g", Color.GREEN, 20, 7, 10, True),
             ("Bandit", "b", Color.RED, 35, 10, 10, True),
         ]
-        for _ in range(40):
+        # Scale creature count with world size
+        creature_count = min(20, max(5, (self.world_map.width * self.world_map.height) // 200))
+        for _ in range(creature_count):
             tile = self.rng.choice(walkable)
             name, glyph, color, hp, strn, agi, hostile = self.rng.choice(creature_types)
             self.factory.create_creature(
