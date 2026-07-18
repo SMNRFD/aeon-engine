@@ -1,0 +1,133 @@
+# YAML mod example for the Aeon Engine
+# Demonstrates the same content as example_mod.json but in YAML format.
+# Requires PyYAML: pip install pyyaml
+
+mod_id: yaml_content_pack
+name: YAML Content Pack
+version: 0.1.0
+description: An example YAML mod that adds new items, creatures, and spells.
+author: Aeon Team
+dependencies: []
+conflicts: []
+tags:
+  - item_pack
+  - monster_pack
+  - spell_pack
+
+content:
+  items:
+    - archetype: longsword
+      name: Moonlight Blade
+      material: mithril
+      quality: excellent
+      rarity: epic
+      enchantments:
+        - type: cold_damage
+          magnitude: 3.0
+      history:
+        - Forged under a full moon by elven smiths.
+
+    - archetype: ring
+      name: Ring of Wisdom
+      material: gold
+      quality: fine
+      rarity: rare
+      properties:
+        intelligence: 5.0
+      enchantments:
+        - type: mana_regen
+          magnitude: 1.0
+
+    - archetype: health_potion
+      name: Elixir of Life
+      quality: excellent
+      rarity: legendary
+      properties:
+        heal: 100.0
+
+  creatures:
+    - id: shadow_stalker
+      name: Shadow Stalker
+      glyph: S
+      color: 90
+      hp: 60
+      strength: 12
+      agility: 18
+      aggressive: true
+      tags:
+        - hostile
+        - magical
+        - shadow
+
+    - id: crystal_golem
+      name: Crystal Golem
+      glyph: G
+      color: 159
+      hp: 150
+      strength: 20
+      agility: 4
+      aggressive: false
+      tags:
+        - magical
+        - construct
+
+  spells:
+    - id: void_bolt
+      name: Void Bolt
+      school: evocation
+      mana_cost: 25
+      cast_time: 1.5
+      target: enemy
+      effects:
+        - kind: damage
+          magnitude: 40.0
+          damage_type: true
+      tags:
+        - void
+        - destructive
+
+    - id: shadow_step
+      name: Shadow Step
+      school: transmutation
+      mana_cost: 15
+      cast_time: 0.5
+      target: self
+      effects:
+        - kind: teleport
+          magnitude: 0.0
+          data:
+            range: 20
+      tags:
+        - movement
+        - shadow
+
+  skills:
+    - id: shadow_weaving
+      name: Shadow Weaving
+      category: magic
+      governing_attribute: willpower
+      difficulty: 1.6
+      base_xp: 200
+      description: Manipulate shadow substance.
+
+    - id: crystal_carving
+      name: Crystal Carving
+      category: craft
+      governing_attribute: agility
+      difficulty: 1.3
+      base_xp: 140
+      description: Shape magical crystals into tools and weapons.
+
+  recipes:
+    - id: moonlight_blade_recipe
+      name: Moonlight Blade
+      skill: smithing
+      level_required: 40
+      result_archetype: longsword
+      result_material: mithril
+      materials:
+        mithril: 5
+        crystal: 2
+      base_time: 300
+      base_xp: 500
+      difficulty: 2.0

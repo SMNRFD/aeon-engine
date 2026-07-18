@@ -1,0 +1,73 @@
+# Aeon Engine configuration file
+
+[engine]
+engine_name = "Aeon"
+version = "0.1.0"
+debug = false
+log_level = "INFO"
+log_file = "aeon.log"
+
+[world]
+world_seed = 48879
+region_size = 64
+world_tiles_x = 256
+world_tiles_y = 256
+sea_level = 0.42
+mountain_level = 0.78
+temperature_noise_scale = 4.0
+moisture_noise_scale = 3.5
+enable_rivers = true
+enable_roads = true
+initial_npc_density = 0.012
+
+[simulation]
+ticks_per_second = 20
+ticks_per_game_minute = 10
+minutes_per_game_hour = 60
+hours_per_day = 24
+days_per_season = 30
+seasons_per_year = 4
+npc_simulation_chunk_size = 64
+async_npc_simulation = false
+
+[plugins]
+plugin_dirs = ["plugins"]
+hot_reload = true
+sandbox_enabled = false
+autoload_enabled = true
+
+[save]
+save_dir = "saves"
+autosave_interval_ticks = 1200
+max_autosaves = 5
+compression = "zlib"
+integrity_check = true
+
+[ui]
+theme = "dark"
+color_enabled = true
+unicode_enabled = true
+message_log_size = 200
+viewport_width = 80
+viewport_height = 24
+
+[audio]
+play_files = false
+silent = false
+enable_bell = true
+master_volume = 1.0
+music_volume = 0.7
+sfx_volume = 1.0
+ambient_volume = 0.5
+
+[accessibility]
+color_blindness = 0  # 0=none, 1=protanopia, 2=deuteranopia, 3=tritanopia, 4=achromatopsia
+large_text = false
+high_contrast = false
+reduced_motion = false
+audio_cues = true
+caption_sounds = false
+
+[mods]
+mods_dir = "mods"
+autoload = true

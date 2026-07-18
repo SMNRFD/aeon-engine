@@ -1,0 +1,21 @@
+[
+  {
+    "archetype": "greatsword",
+    "name": "Dragon Slayer",
+    "material": "dragonbone",
+    "quality": "excellent",
+    "rarity": "legendary",
+    "enchantments": [
+      {"type": "fire_damage", "magnitude": 8.0}
+    ],
+    "history": ["Forged to slay the ancient dragon Vythraxis."]
+  },
+  {
+    "archetype": "plate_armor",
+    "name": "Dragonscale Plate",
+    "material": "dragonbone",
+    "quality": "excellent",
+    "rarity": "epic",
+    "properties": {"armor": 18.0, "fire_resist": 0.8}
+  }
+]

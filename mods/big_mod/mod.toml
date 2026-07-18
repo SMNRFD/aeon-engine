@@ -1,0 +1,18 @@
+# Multi-file mod manifest
+
+mod_id = "big_content_pack"
+name = "Big Content Pack"
+version = "1.0.0"
+description = "A large multi-file mod demonstrating the directory mod format."
+author = "Aeon Team"
+license = "MIT"
+dependencies = []
+conflicts = []
+tags = ["content_pack", "item_pack", "monster_pack"]
+
+[content]
+items = []
+creatures = []
+spells = []
+skills = []
+recipes = []

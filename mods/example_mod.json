@@ -1,0 +1,77 @@
+{
+  "mod_id": "example_content_mod",
+  "name": "Example Content Mod",
+  "version": "0.1.0",
+  "description": "An example JSON mod that adds new items and creatures.",
+  "author": "Aeon Team",
+  "type": ["item_pack", "monster_pack"],
+  "content": {
+    "items": [
+      {
+        "archetype": "longsword",
+        "name": "Sunsteel Blade",
+        "material": "steel",
+        "quality": "excellent",
+        "rarity": "rare",
+        "enchantments": [
+          {"type": "fire_damage", "magnitude": 2.5}
+        ],
+        "history": ["Forged in the heart of the sun."]
+      },
+      {
+        "archetype": "health_potion",
+        "name": "Greater Healing Draught",
+        "quality": "fine",
+        "rarity": "uncommon",
+        "properties": {"heal": 60.0}
+      }
+    ],
+    "creatures": [
+      {
+        "name": "Forest Troll",
+        "glyph": "T",
+        "color": 71,
+        "hp": 80,
+        "strength": 14,
+        "agility": 6,
+        "aggressive": true,
+        "tags": ["hostile", "regenerating"]
+      },
+      {
+        "name": "Crystal Wolf",
+        "glyph": "w",
+        "color": 159,
+        "hp": 40,
+        "strength": 10,
+        "agility": 16,
+        "aggressive": true,
+        "tags": ["hostile", "magical"]
+      }
+    ],
+    "skills": [
+      {
+        "id": "runecrafting",
+        "name": "Runecrafting",
+        "category": "magic",
+        "governing_attribute": "intelligence",
+        "difficulty": 1.4,
+        "base_xp": 180,
+        "description": "Engraving magical runes onto items."
+      }
+    ],
+    "spells": [
+      {
+        "id": "icelance",
+        "name": "Ice Lance",
+        "school": "evocation",
+        "mana_cost": 18,
+        "cast_time": 1.2,
+        "target": "enemy",
+        "effects": [
+          {"kind": "damage", "magnitude": 32.0, "damage_type": "cold"}
+        ],
+        "tags": ["cold"]
+      }
+    ]
+  }
+}

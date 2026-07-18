@@ -1,0 +1,9 @@
+{
+  "item.greatsword": "Greatsword",
+  "item.dragon_slayer": "Dragon Slayer",
+  "item.dragonscale_plate": "Dragonscale Plate",
+  "creature.vythraxis": "Vythraxis the Ancient",
+  "creature.frost_wyrm": "Frost Wyrm",
+  "quest.slay_dragon": "Slay the Dragon",
+  "quest.slay_dragon.desc": "Defeat Vythraxis the Ancient in his mountain lair."
+}

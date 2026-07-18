@@ -1,0 +1,24 @@
+[
+  {
+    "id": "vythraxis",
+    "name": "Vythraxis the Ancient",
+    "glyph": "D",
+    "color": 196,
+    "hp": 500,
+    "strength": 30,
+    "agility": 12,
+    "aggressive": true,
+    "tags": ["hostile", "dragon", "ancient", "fire"]
+  },
+  {
+    "id": "frost_wyrm",
+    "name": "Frost Wyrm",
+    "glyph": "D",
+    "color": 75,
+    "hp": 350,
+    "strength": 25,
+    "agility": 14,
+    "aggressive": true,
+    "tags": ["hostile", "dragon", "cold"]
+  }
+]
