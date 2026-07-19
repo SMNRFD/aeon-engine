@@ -12707,3 +12707,264 @@ AttributeError: 'Identity' object has no attribute 'tags'
 2026-07-20 00:21:44 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.65 KB)
 2026-07-20 00:23:11 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.64 KB)
 2026-07-20 00:24:43 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.63 KB)
+2026-07-20 00:26:17 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.63 KB)
+2026-07-20 00:26:22 [INFO   ] aeon.engine: Shutting down engine
+2026-07-20 00:26:24 [INFO   ] aeon.repl: Starting Aeon Engine v0.1.0
+2026-07-20 00:26:24 [INFO   ] aeon.world.gen: Generating world 128x128 (seed=48879)
+2026-07-20 00:26:25 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-20 00:26:25 [DEBUG  ] aeon.world.gen: Placed 6 settlements
+2026-07-20 00:26:26 [INFO   ] aeon.world.gen: World generation complete
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#15.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#16.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#17.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#18.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#19.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#20.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#21.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#22.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#23.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#24.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#25.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#26.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#27.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#28.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#29.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#30.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#31.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#32.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#33.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#34.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#35.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#36.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#37.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#38.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#39.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#40.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#41.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#42.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#43.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#44.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#45.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#46.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#47.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#48.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#49.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#50.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#51.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#52.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#53.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#54.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#55.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#56.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#57.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#58.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#59.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#60.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#61.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#62.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#63.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#64.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#65.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#66.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#67.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#68.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#69.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#70.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#71.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#72.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#73.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#74.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#75.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#76.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#77.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#78.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#79.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#80.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#81.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#82.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#83.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#84.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#85.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#86.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#87.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#88.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#89.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#90.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#91.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#92.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#93.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#94.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#95.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#96.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#97.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#98.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#99.0
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#100.0
+2026-07-20 00:26:26 [INFO   ] aeon.engine: Populated world with 60 NPCs and ~40 creatures
+2026-07-20 00:26:26 [INFO   ] aeon.engine: World generated: 128x128
+2026-07-20 00:26:26 [DEBUG  ] aeon.ecs: Created Entity#101.0
+2026-07-20 00:26:26 [INFO   ] aeon.engine: Player created: Hero
+2026-07-20 00:26:26 [INFO   ] aeon.plugins.manager: Discovered 0 plugins
+2026-07-20 00:26:26 [INFO   ] aeon.repl: Plugins loaded: 0 success, 0 failed
+2026-07-20 00:26:27 [DEBUG  ] aeon.ecs: Destroyed Entity#75.0
+2026-07-20 00:26:29 [DEBUG  ] aeon.ecs: Destroyed Entity#87.0
+2026-07-20 00:26:29 [DEBUG  ] aeon.ecs: Destroyed Entity#89.0
+2026-07-20 00:26:30 [DEBUG  ] aeon.ecs: Destroyed Entity#63.0
+2026-07-20 00:26:31 [DEBUG  ] aeon.ecs: Destroyed Entity#97.0
+2026-07-20 00:26:32 [DEBUG  ] aeon.ecs: Destroyed Entity#83.0
+2026-07-20 00:26:35 [DEBUG  ] aeon.ecs: Destroyed Entity#73.0
+2026-07-20 00:26:42 [DEBUG  ] aeon.ecs: Destroyed Entity#91.0
+2026-07-20 00:26:47 [DEBUG  ] aeon.ecs: Destroyed Entity#71.0
+2026-07-20 00:26:54 [DEBUG  ] aeon.ecs: Destroyed Entity#81.0
+2026-07-20 00:26:59 [DEBUG  ] aeon.ecs: Destroyed Entity#79.0
+2026-07-20 00:27:01 [DEBUG  ] aeon.ecs: Destroyed Entity#69.0
+2026-07-20 00:27:01 [DEBUG  ] aeon.ecs: Destroyed Entity#99.0
+2026-07-20 00:27:17 [DEBUG  ] aeon.ecs: Destroyed Entity#67.0
+2026-07-20 00:27:18 [DEBUG  ] aeon.ecs: Destroyed Entity#65.0
+2026-07-20 00:27:51 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.52 KB)
+2026-07-20 00:27:53 [INFO   ] aeon.engine: Shutting down engine
+2026-07-20 00:28:08 [INFO   ] aeon.repl: Starting Aeon Engine v0.1.0
+2026-07-20 00:28:08 [INFO   ] aeon.world.gen: Generating world 128x128 (seed=48879)
+2026-07-20 00:28:09 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-20 00:28:09 [DEBUG  ] aeon.world.gen: Placed 6 settlements
+2026-07-20 00:28:09 [INFO   ] aeon.world.gen: World generation complete
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#15.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#16.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#17.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#18.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#19.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#20.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#21.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#22.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#23.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#24.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#25.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#26.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#27.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#28.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#29.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#30.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#31.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#32.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#33.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#34.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#35.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#36.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#37.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#38.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#39.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#40.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#41.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#42.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#43.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#44.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#45.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#46.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#47.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#48.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#49.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#50.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#51.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#52.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#53.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#54.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#55.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#56.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#57.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#58.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#59.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#60.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#61.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#62.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#63.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#64.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#65.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#66.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#67.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#68.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#69.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#70.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#71.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#72.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#73.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#74.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#75.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#76.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#77.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#78.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#79.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#80.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#81.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#82.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#83.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#84.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#85.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#86.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#87.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#88.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#89.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#90.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#91.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#92.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#93.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#94.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#95.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#96.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#97.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#98.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#99.0
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#100.0
+2026-07-20 00:28:10 [INFO   ] aeon.engine: Populated world with 60 NPCs and ~40 creatures
+2026-07-20 00:28:10 [INFO   ] aeon.engine: World generated: 128x128
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Created Entity#101.0
+2026-07-20 00:28:10 [INFO   ] aeon.engine: Player created: Hero
+2026-07-20 00:28:10 [INFO   ] aeon.plugins.manager: Discovered 0 plugins
+2026-07-20 00:28:10 [INFO   ] aeon.repl: Plugins loaded: 0 success, 0 failed
+2026-07-20 00:28:10 [DEBUG  ] aeon.ecs: Destroyed Entity#75.0
+2026-07-20 00:28:13 [DEBUG  ] aeon.ecs: Destroyed Entity#87.0
+2026-07-20 00:28:13 [DEBUG  ] aeon.ecs: Destroyed Entity#89.0
+2026-07-20 00:28:14 [DEBUG  ] aeon.ecs: Destroyed Entity#63.0
+2026-07-20 00:28:15 [DEBUG  ] aeon.ecs: Destroyed Entity#97.0
+2026-07-20 00:28:16 [DEBUG  ] aeon.ecs: Destroyed Entity#83.0
+2026-07-20 00:28:19 [DEBUG  ] aeon.ecs: Destroyed Entity#73.0
+2026-07-20 00:28:25 [DEBUG  ] aeon.ecs: Destroyed Entity#91.0
+2026-07-20 00:28:30 [DEBUG  ] aeon.ecs: Destroyed Entity#71.0
+2026-07-20 00:28:38 [DEBUG  ] aeon.ecs: Destroyed Entity#81.0
+2026-07-20 00:28:43 [DEBUG  ] aeon.ecs: Destroyed Entity#79.0
+2026-07-20 00:28:44 [DEBUG  ] aeon.ecs: Destroyed Entity#69.0
+2026-07-20 00:28:44 [DEBUG  ] aeon.ecs: Destroyed Entity#99.0
+2026-07-20 00:29:02 [DEBUG  ] aeon.ecs: Destroyed Entity#67.0
+2026-07-20 00:29:02 [DEBUG  ] aeon.ecs: Destroyed Entity#65.0
+2026-07-20 00:29:38 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.52 KB)
+2026-07-20 00:30:15 [DEBUG  ] aeon.ecs: Destroyed Entity#77.0
+2026-07-20 00:31:08 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.47 KB)
+2026-07-20 00:32:33 [INFO   ] aeon.save: Saved game to saves\autosave.sav (483.47 KB)
+2026-07-20 00:32:38 [INFO   ] aeon.engine: Shutting down engine
