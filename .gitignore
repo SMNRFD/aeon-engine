@@ -1,4 +1,13 @@
-```
+```gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Logs
 *.log
+
+# Saves/data files
+saves/
 ```

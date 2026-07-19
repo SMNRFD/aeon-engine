@@ -12180,3 +12180,134 @@
 2026-07-19 16:56:42 [INFO   ] aeon.engine: [97mPlayer created: Hero[0m
 2026-07-19 16:56:42 [DEBUG  ] aeon.ecs: Destroyed Entity#77.0
 2026-07-19 16:56:42 [INFO   ] aeon.main: [97mHeadless tick complete. Player id: 101[0m
+2026-07-19 18:32:44 [INFO   ] aeon.engine: [97mInitialising Aeon v0.1.0[0m
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: World initialised
+2026-07-19 18:32:44 [INFO   ] aeon.engine: [97mEngine initialised[0m
+2026-07-19 18:32:44 [INFO   ] aeon.world.gen: [97mGenerating world 20x20 (seed=48879)[0m
+2026-07-19 18:32:44 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-19 18:32:44 [DEBUG  ] aeon.world.gen: Placed 2 settlements
+2026-07-19 18:32:44 [INFO   ] aeon.world.gen: [97mWorld generation complete[0m
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-19 18:32:44 [INFO   ] aeon.engine: [97mPopulated world with 3 NPCs and ~40 creatures[0m
+2026-07-19 18:32:44 [INFO   ] aeon.engine: [97mWorld generated: 20x20[0m
+2026-07-19 18:32:44 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-19 18:32:44 [INFO   ] aeon.engine: [97mPlayer created: TestHero[0m
+2026-07-19 18:32:49 [INFO   ] aeon.engine: [97mInitialising Aeon v0.1.0[0m
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: World initialised
+2026-07-19 18:32:49 [INFO   ] aeon.engine: [97mEngine initialised[0m
+2026-07-19 18:32:49 [INFO   ] aeon.world.gen: [97mGenerating world 20x20 (seed=48879)[0m
+2026-07-19 18:32:49 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-19 18:32:49 [DEBUG  ] aeon.world.gen: Placed 2 settlements
+2026-07-19 18:32:49 [INFO   ] aeon.world.gen: [97mWorld generation complete[0m
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-19 18:32:49 [INFO   ] aeon.engine: [97mPopulated world with 3 NPCs and ~40 creatures[0m
+2026-07-19 18:32:49 [INFO   ] aeon.engine: [97mWorld generated: 20x20[0m
+2026-07-19 18:32:49 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-19 18:32:49 [INFO   ] aeon.engine: [97mPlayer created: TestHero[0m
+2026-07-19 18:32:55 [INFO   ] aeon.engine: [97mInitialising Aeon v0.1.0[0m
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: World initialised
+2026-07-19 18:32:55 [INFO   ] aeon.engine: [97mEngine initialised[0m
+2026-07-19 18:32:55 [INFO   ] aeon.world.gen: [97mGenerating world 20x20 (seed=48879)[0m
+2026-07-19 18:32:55 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-19 18:32:55 [DEBUG  ] aeon.world.gen: Placed 2 settlements
+2026-07-19 18:32:55 [INFO   ] aeon.world.gen: [97mWorld generation complete[0m
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-19 18:32:55 [INFO   ] aeon.engine: [97mPopulated world with 3 NPCs and ~40 creatures[0m
+2026-07-19 18:32:55 [INFO   ] aeon.engine: [97mWorld generated: 20x20[0m
+2026-07-19 18:32:55 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-19 18:32:55 [INFO   ] aeon.engine: [97mPlayer created: TestHero[0m
+2026-07-19 18:33:11 [INFO   ] aeon.engine: [97mInitialising Aeon v0.1.0[0m
+2026-07-19 18:33:11 [DEBUG  ] aeon.ecs: World initialised
+2026-07-19 18:33:11 [INFO   ] aeon.engine: [97mEngine initialised[0m
+2026-07-19 18:33:12 [INFO   ] aeon.world.gen: [97mGenerating world 20x20 (seed=48879)[0m
+2026-07-19 18:33:12 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-19 18:33:12 [DEBUG  ] aeon.world.gen: Placed 2 settlements
+2026-07-19 18:33:12 [INFO   ] aeon.world.gen: [97mWorld generation complete[0m
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-19 18:33:12 [INFO   ] aeon.engine: [97mPopulated world with 3 NPCs and ~40 creatures[0m
+2026-07-19 18:33:12 [INFO   ] aeon.engine: [97mWorld generated: 20x20[0m
+2026-07-19 18:33:12 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-19 18:33:12 [INFO   ] aeon.engine: [97mPlayer created: TestHero[0m
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mInitialising Aeon v0.1.0[0m
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: World initialised
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mEngine initialised[0m
+2026-07-19 18:33:19 [INFO   ] aeon.world.gen: [97mGenerating world 20x20 (seed=48879)[0m
+2026-07-19 18:33:19 [DEBUG  ] aeon.world.gen: Generated 0 rivers (480 attempts)
+2026-07-19 18:33:19 [DEBUG  ] aeon.world.gen: Placed 2 settlements
+2026-07-19 18:33:19 [INFO   ] aeon.world.gen: [97mWorld generation complete[0m
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#1.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#2.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#3.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#4.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#5.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#6.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#7.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#8.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#9.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#10.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#11.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#12.0
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#13.0
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mPopulated world with 3 NPCs and ~40 creatures[0m
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mWorld generated: 20x20[0m
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#14.0
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mPlayer created: TestHero[0m
+2026-07-19 18:33:19 [DEBUG  ] aeon.ecs: Created Entity#15.0
+2026-07-19 18:33:19 [ERROR  ] aeon.repl: [31mCommand pickup failed[0m
+Traceback (most recent call last):
+  File "/workspace/engine/repl/repl.py", line 1487, in _execute_command
+    handler(args)
+  File "/workspace/engine/repl/repl.py", line 725, in cmd_pickup
+    if identity and "item" in identity.tags:
+                              ^^^^^^^^^^^^^
+AttributeError: 'Identity' object has no attribute 'tags'
+2026-07-19 18:33:19 [INFO   ] aeon.save: [97mSaved game to saves/test.sav (17.07 KB)[0m
+2026-07-19 18:33:19 [INFO   ] aeon.engine: [97mLoaded save: test[0m
