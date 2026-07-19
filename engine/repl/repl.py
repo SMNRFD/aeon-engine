@@ -3262,7 +3262,13 @@ class GameREPL:
     def _read_live_input_nonblocking(self) -> None:
         """Read any pending stdin input without blocking.
 
-        Uses ``select`` to poll stdin for available bytes. For each byte:
+        Cross-platform:
+        - On Windows: uses ``msvcrt.kbhit`` / ``msvcrt.getch`` (the
+          ``termios``/``select`` modules don't exist on Windows).
+        - On Unix: uses ``select.select`` to poll the stdin file
+          descriptor with a zero timeout (non-blocking).
+
+        For each byte read:
         - Enter (\\r / \\n) commits the current ``_live_input`` as a
           completed command and pushes it onto the input queue.
         - Backspace deletes the last char of ``_live_input``.
@@ -3271,18 +3277,23 @@ class GameREPL:
         - Printable chars are appended to ``_live_input``.
 
         This runs on the MAIN thread (not a background thread) so there's
-        no race with ``Live``'s terminal state. The terminal is in raw
-        no-echo mode for the duration of ``_run_live``, so the terminal
-        itself doesn't echo typed chars (which would clobber the layout).
+        no race with ``Live``'s terminal state.
         """
+        if sys.platform == "win32":
+            self._read_live_input_windows()
+        else:
+            self._read_live_input_unix()
+
+    def _read_live_input_unix(self) -> None:
+        """Non-blocking stdin reader for Unix (Linux/macOS)."""
         import select as _select
         import os as _os
         try:
             fd = sys.stdin.fileno()
         except Exception:  # noqa: BLE001
             return
-        # Drain all available bytes (up to 256) without blocking.
-        deadline = time.perf_counter() + 0.05  # max 50ms per drain
+        # Drain all available bytes without blocking (max 50ms per drain).
+        deadline = time.perf_counter() + 0.05
         while time.perf_counter() < deadline:
             try:
                 r, _, _ = _select.select([fd], [], [], 0.0)
@@ -3331,30 +3342,98 @@ class GameREPL:
             if ch.isprintable():
                 self._live_input += ch
 
+    def _read_live_input_windows(self) -> None:
+        """Non-blocking stdin reader for Windows using ``msvcrt``.
+
+        ``msvcrt.getch`` returns a bytes object of length 1 for ordinary
+        keys, or the special prefix ``b'\\x00'`` / ``b'\\xe0'`` for
+        extended keys (arrows, function keys) followed by a second
+        ``getch`` call for the key code. We only care about printable
+        chars, Enter, Backspace, Ctrl-C, and Ctrl-D; everything else is
+        discarded.
+        """
+        import msvcrt  # type: ignore[import-not-found]
+        # Drain all available keystrokes without blocking.
+        deadline = time.perf_counter() + 0.05
+        while time.perf_counter() < deadline:
+            if not msvcrt.kbhit():
+                return  # no key available right now
+            try:
+                ch_bytes = msvcrt.getch()
+            except OSError:
+                return
+            if not ch_bytes:
+                return
+            # Extended key prefix — read and discard the second byte.
+            if ch_bytes in (b"\x00", b"\xe0"):
+                try:
+                    msvcrt.getch()
+                except OSError:
+                    pass
+                continue
+            ch = ch_bytes.decode("latin-1", errors="replace")
+            if not ch:
+                continue
+            # Map special chars.
+            if ch in ("\r", "\n"):
+                line = self._live_input
+                self._live_input = ""
+                self._input_queue.put(line)
+                continue
+            if ch in ("\x7f", "\x08"):  # Backspace
+                if self._live_input:
+                    self._live_input = self._live_input[:-1]
+                continue
+            if ch == "\x03":  # Ctrl-C
+                self._input_queue.put(None)
+                return
+            if ch == "\x04":  # Ctrl-D
+                self._input_queue.put(None)
+                return
+            if ch == "\x1b":  # Escape — discard
+                continue
+            if ch == "\t":
+                continue
+            if ch.isprintable():
+                self._live_input += ch
+
     def _run_live(self) -> None:
         """Run the game in live-dashboard mode with rich.live.Live.
 
-        SINGLE-THREADED, NON-BLOCKING INPUT design:
-        The terminal is switched to raw no-echo mode once at startup.
-        Each animation frame, after updating the Live display, we poll
-        stdin with ``select`` (zero-timeout = non-blocking) and drain
-        any pending characters. This avoids the race condition that
-        plagued the threaded version, where the input thread's
-        ``tty.setraw`` fought with ``Live``'s own terminal manipulation.
+        SINGLE-THREADED, NON-BLOCKING INPUT design (cross-platform):
+        - On Unix: switch stdin to raw no-echo mode once at startup
+          (using ``termios``/``tty``), then poll stdin with ``select``
+          each animation frame.
+        - On Windows: no terminal-mode switch is needed (``msvcrt``
+          reads keys directly without cooked-mode echo), so we just poll
+          ``msvcrt.kbhit`` each frame.
+        Each animation frame: poll stdin -> drain chars -> update
+        ``_live_input`` -> push completed lines onto queue -> drain
+        queue -> execute commands -> advance simulation -> update Live
+        display -> sleep one frame.
         """
-        import termios
-        import tty
-        # Switch stdin to raw, no-echo mode for the duration of live mode.
-        try:
-            fd = sys.stdin.fileno()
-            old_term_settings = termios.tcgetattr(fd)
-            tty.setraw(fd)
-            new = termios.tcgetattr(fd)
-            new[3] = new[3] & ~termios.ECHO  # lflags &= ~ECHO
-            termios.tcsetattr(fd, termios.TCSANOW, new)
-        except Exception:  # noqa: BLE001 — not a TTY
-            old_term_settings = None
-            fd = None
+        is_windows = (sys.platform == "win32")
+        old_term_settings = None
+        fd = None
+
+        if not is_windows:
+            # Unix: switch stdin to raw, no-echo mode for the duration of
+            # live mode so the terminal doesn't echo typed chars (which
+            # would clobber the live layout).
+            try:
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old_term_settings = termios.tcgetattr(fd)
+                tty.setraw(fd)
+                new = termios.tcgetattr(fd)
+                new[3] = new[3] & ~termios.ECHO  # lflags &= ~ECHO
+                termios.tcsetattr(fd, termios.TCSANOW, new)
+            except Exception:  # noqa: BLE001 — not a TTY or termios unavailable
+                old_term_settings = None
+                fd = None
+        # Windows: msvcrt reads keys without terminal-mode manipulation,
+        # and rich's Live(screen=True) handles the console buffer itself.
 
         self._last_sim_time = time.perf_counter()
         try:
@@ -3367,7 +3446,9 @@ class GameREPL:
             ) as live:
                 while self.running:
                     # 1. Read any pending input (non-blocking, main thread).
-                    if fd is not None:
+                    #    On Unix we need fd != None (raw mode active);
+                    #    on Windows we always try.
+                    if is_windows or fd is not None:
                         self._read_live_input_nonblocking()
                     # 2. Drain completed command lines from the queue.
                     try:
@@ -3408,9 +3489,10 @@ class GameREPL:
         except KeyboardInterrupt:
             pass
         finally:
-            # Restore terminal state.
-            if old_term_settings is not None:
+            # Restore terminal state (Unix only).
+            if old_term_settings is not None and fd is not None:
                 try:
+                    import termios
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term_settings)
                 except Exception:  # noqa: BLE001
                     pass
