@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-aeon = "main:main"
+aeon = "engine.repl.repl:main"
 
 [tool.setuptools]
 packages = ["engine"]
