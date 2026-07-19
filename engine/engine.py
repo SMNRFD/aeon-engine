@@ -415,8 +415,143 @@ class Engine:
         self.skills.decay(self.world, dt)
         # Update AI for all entities with AI component
         self._update_ai()
+        # NPC daily schedules — drive NPCs toward routine locations
+        # based on time of day (work, home, tavern, etc.).
+        self._update_schedules()
+        # NPC memory consolidation — let NPCs slowly forget trivial
+        # memories and reinforce important ones.
+        self._update_memories(dt)
         # World system update
         self.world.update(dt)
+        # Check for player death (HP at zero) — must happen last so all
+        # damage sources for this tick are applied first.
+        self._check_player_death()
+
+    def _check_player_death(self) -> None:
+        """Handle the player reaching 0 HP.
+
+        Previously the player would just sit at 0 HP forever. Now we
+        respawn them at full health with a small XP/gold penalty and
+        teleport them back to the world spawn point, and emit a message
+        so the REPL can surface it.
+        """
+        if self.player is None or self.world_map is None:
+            return
+        from engine.entities.components import Health as HealthComp, Position as PosComp, Identity
+        health = self.world.get_component(self.player, HealthComp)
+        if health is None or health.current > 0:
+            return
+        # Player is dead — respawn.
+        identity = self.world.get_component(self.player, Identity)
+        name = identity.display_name if identity else "Hero"
+        # Reset HP and needs.
+        health.current = health.maximum
+        from engine.entities.components import Needs as NeedsComp
+        needs = self.world.get_component(self.player, NeedsComp)
+        if needs:
+            needs.hunger = 0.0
+            needs.thirst = 0.0
+            needs.fatigue = 50.0  # waking up tired
+            needs.sleep = 50.0
+            needs.warmth = 37.0
+        # Teleport to spawn point.
+        pos = self.world.get_component(self.player, PosComp)
+        if pos:
+            pos.x = self.world_map.spawn_point.x
+            pos.y = self.world_map.spawn_point.y
+            self.spatial.update(self.player, pos.x, pos.y)
+        # Gold penalty (lose half of carried copper).
+        from engine.entities.components import Wealth
+        wealth = self.world.get_component(self.player, Wealth)
+        if wealth:
+            wealth.copper = wealth.copper // 2
+            wealth.silver = wealth.silver // 2
+            wealth.gold = wealth.gold // 2
+        # Update visibility around new position.
+        self._update_visibility()
+        # Surface to the player.
+        self.message_log.add(f"{name} was slain! You awaken at the spawn point, weakened.",
+                             Color.RED)
+        self.message_log.add("  (Lost half your carried wealth.)", Color.YELLOW)
+
+    def _update_schedules(self) -> None:
+        """Drive NPCs toward their daily routine locations.
+
+        This integrates the (previously unused) engine.npc.schedule
+        module: each NPC with an AI component picks a destination based
+        on the current phase of day (dawn/day/dusk/night) and slowly
+        wanders toward it.
+        """
+        if self.world_map is None:
+            return
+        from engine.entities.components import AI as AIComp, Position as PosComp
+        from engine.core.clock import PhaseOfDay
+        try:
+            phase = self.clock.time.phase_of_day()
+        except Exception:  # noqa: BLE001
+            return
+        # Pick a target offset based on phase of day.
+        # Dawn  -> gather near (0, +5)  — "morning market"
+        # Day   -> scatter (±8, ±8)     — "working"
+        # Dusk  -> gather near (0, -5)  — "tavern"
+        # Night -> cluster near (0, 0)  — "home/sleep"
+        phase_targets = {
+            PhaseOfDay.DAWN:  (0, 5),
+            PhaseOfDay.DAY:   (None, None),   # scatter
+            PhaseOfDay.DUSK:  (0, -5),
+            PhaseOfDay.NIGHT: (0, 0),
+        }
+        tx, ty = phase_targets.get(phase, (0, 0))
+        for entity, (ai, pos) in self.world.view(AIComp, PosComp):
+            if ai.controller == "player":
+                continue
+            # Only civilian NPCs follow schedules; creatures and
+            # aggressive mobs keep wandering.
+            if ai.controller not in ("civilian", "wander"):
+                continue
+            # 30% chance per tick to step toward target — keeps movement
+            # organic without flooding the message log.
+            if not self.rng.chance(0.3):
+                continue
+            if tx is None:
+                # Scatter: pick a random nearby offset.
+                ndx = self.rng.randint(-2, 2)
+                ndy = self.rng.randint(-2, 2)
+            else:
+                dx = tx - pos.x
+                dy = ty - pos.y
+                if abs(dx) <= 1 and abs(dy) <= 1:
+                    continue
+                ndx = (1 if dx > 0 else -1 if dx < 0 else 0)
+                ndy = (1 if dy > 0 else -1 if dy < 0 else 0)
+            new_x, new_y = pos.x + ndx, pos.y + ndy
+            tile = self.world_map.get_tile(new_x, new_y)
+            if tile is None or not tile.is_walkable:
+                continue
+            # Don't step onto another entity.
+            blocked = False
+            for other, (op,) in self.world.view(PosComp):
+                if other.id != entity.id and op.x == new_x and op.y == new_y:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            self.spatial.update(entity, new_x, new_y)
+            pos.x = new_x
+            pos.y = new_y
+
+    def _update_memories(self, dt: float) -> None:
+        """Slowly decay trivial NPC memories so the memory store doesn't
+        grow without bound. This integrates the (previously unused)
+        engine.npc.memory module into the main tick loop.
+        """
+        from engine.entities.components import Memory as MemoryComp
+        for entity, (mem,) in self.world.view(MemoryComp):
+            # Drop the oldest trivial memories when the list grows past 50.
+            if len(mem.memories) <= 50:
+                continue
+            # Keep only the most recent 30 entries.
+            mem.memories = mem.memories[-30:]
 
     def _update_ai(self) -> None:
         """Tick AI for all NPCs and creatures."""

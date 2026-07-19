@@ -1372,7 +1372,8 @@ class GameREPL:
             ("Themes", "theme list; theme set <name>"),
             ("Dimensions", "dimensions; portal <from> <to>; travel <dim>"),
             ("Body Parts", "bodyparts; heal_part <part> [amount]"),
-            ("System", "save [name]; load <name>; plugins; help (?); banner; Quit (q)"),
+            ("System", "save [name]; load <name>; plugins; help (?); banner; respawn; "
+                         "memory [npc]; schedule; Quit (q)"),
         ]
         for cat, lines in categories:
             table.add_row(cat, lines)
@@ -1643,6 +1644,76 @@ class GameREPL:
     def cmd_quit(self, args: list[str]) -> None:
         self.running = False
         self.engine.shutdown()
+
+    def cmd_respawn(self, args: list[str]) -> None:
+        """Manually respawn (useful if the player gets stuck)."""
+        if self.engine.player is None:
+            return
+        from engine.entities.components import Health as HealthComp, Needs as NeedsComp
+        health = self.engine.world.get_component(self.engine.player, HealthComp)
+        if health:
+            health.current = health.maximum
+        needs = self.engine.world.get_component(self.engine.player, NeedsComp)
+        if needs:
+            needs.hunger = 0.0
+            needs.thirst = 0.0
+            needs.fatigue = 0.0
+            needs.sleep = 0.0
+            needs.warmth = 37.0
+        if self.engine.world_map is not None:
+            pos = self.engine.world.get_component(self.engine.player, Position)
+            if pos:
+                pos.x = self.engine.world_map.spawn_point.x
+                pos.y = self.engine.world_map.spawn_point.y
+                self.engine.spatial.update(self.engine.player, pos.x, pos.y)
+        self.engine._update_visibility()
+        self.msg("You have been restored to full health at the spawn point.",
+                 Color.GREEN)
+
+    def cmd_memory(self, args: list[str]) -> None:
+        """Show an NPC's memories (integrates the NPC memory system)."""
+        if args:
+            target = self._find_entity_by_name(" ".join(args))
+        else:
+            target = self._find_adjacent_npc()
+        if target is None:
+            self.set_output(Text("No NPC nearby to inspect. Usage: memory [npc_name]",
+                                 style="dim"), title="Memory")
+            return
+        from engine.entities.components import Memory as MemoryComp, Identity
+        mem = self.engine.world.get_component(target, MemoryComp)
+        ident = self.engine.world.get_component(target, Identity)
+        name = ident.display_name if ident else "NPC"
+        body = Text()
+        body.append(f"{name}'s memories:\n", style="bold gold1")
+        if mem is None or not mem.memories:
+            body.append("  (no memories yet)\n", style="dim")
+        else:
+            for i, m in enumerate(mem.memories[-15:]):
+                desc = m.get("description", str(m)) if isinstance(m, dict) else str(m)
+                body.append(f"  [{i}] {desc[:80]}\n", style="white")
+            body.append(f"\nKnowledge: {len(mem.knowledge)} facts\n", style="dim")
+            for k, v in list(mem.knowledge.items())[:10]:
+                body.append(f"  {k}: {v:.1f}\n", style="dim")
+        self.set_output(body, title=f"Memory — {name}")
+
+    def cmd_schedule(self, args: list[str]) -> None:
+        """Show the current daily schedule phase (integrates the schedule system)."""
+        try:
+            phase = self.engine.clock.time.phase_of_day()
+            phase_name = phase.display_name
+        except Exception:  # noqa: BLE001
+            phase_name = "Unknown"
+        hour = self.engine.clock.time.hour
+        body = Text()
+        body.append(f"Current phase: {phase_name}\n", style="cyan")
+        body.append(f"Hour: {hour:02d}:00\n", style="white")
+        body.append("\nNPC routine targets:\n", style="bold yellow")
+        body.append("  Dawn (4-7):   gather at market\n", style="white")
+        body.append("  Day (7-17):   scatter to work\n", style="white")
+        body.append("  Dusk (17-20): gather at tavern\n", style="white")
+        body.append("  Night (20-4): return home to sleep\n", style="white")
+        self.set_output(body, title="Daily Schedule")
 
     def cmd_fish(self, args: list[str]) -> None:
         if self.engine.player is None:
@@ -3177,17 +3248,90 @@ class GameREPL:
                      border_style="green", expand=True, height=3)
 
     def _input_reader_loop(self) -> None:
-        """Background thread that reads stdin line-by-line without blocking the UI.
+        """Background thread that reads stdin character-by-character in raw
+        mode, so typed text appears in the input panel immediately (not
+        echoed by the terminal cooked-mode handler, which would write
+        directly to the screen and overwrite the live layout).
 
-        Pushes each completed line (or None on EOF) onto the input queue.
+        Completed lines (on Enter) are pushed onto the input queue. This
+        is the fix for the "input is not working / text overcomes the UI"
+        bug — we take over terminal echo ourselves and render the typed
+        text inside the input panel via ``self._live_input``.
         """
-        while not self._input_stop.is_set():
+        import termios
+        import tty
+        # Save the terminal state and switch to raw, no-echo mode so the
+        # terminal doesn't echo typed chars (which would clobber the live
+        # layout). We restore on exit.
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+        except Exception:  # noqa: BLE001 — not a TTY
+            old_settings = None
+        if old_settings is not None:
             try:
-                line = input()
-            except (EOFError, KeyboardInterrupt):
-                self._input_queue.put(None)
-                return
-            self._input_queue.put(line)
+                tty.setraw(fd)
+                # Disable terminal echo explicitly (raw mode usually does
+                # this, but be defensive).
+                new = termios.tcgetattr(fd)
+                new[3] = new[3] & ~termios.ECHO  # lflags &= ~ECHO
+                termios.tcsetattr(fd, termios.TCSANOW, new)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            while not self._input_stop.is_set():
+                try:
+                    ch = sys.stdin.read(1)
+                except (EOFError, KeyboardInterrupt, OSError):
+                    self._input_queue.put(None)
+                    return
+                if not ch:
+                    self._input_queue.put(None)
+                    return
+                # Map special chars to event keys.
+                if ch in ("\r", "\n"):
+                    # Enter: commit the current line.
+                    line = self._live_input
+                    self._live_input = ""
+                    self._input_queue.put(line)
+                    continue
+                if ch in ("\x7f", "\x08"):
+                    # Backspace.
+                    if self._live_input:
+                        self._live_input = self._live_input[:-1]
+                    continue
+                if ch == "\x03":  # Ctrl-C
+                    self._input_queue.put(None)
+                    return
+                if ch == "\x04":  # Ctrl-D
+                    self._input_queue.put(None)
+                    return
+                if ch == "\x1b":
+                    # Escape sequence (arrows etc.) — read the rest and
+                    # discard (we don't support history navigation in live
+                    # mode yet, but we don't want the escape bytes leaking
+                    # into _live_input either).
+                    try:
+                        ch2 = sys.stdin.read(1)
+                        if ch2 == "[":
+                            sys.stdin.read(1)  # consume the final byte
+                        elif ch2 == "O":
+                            sys.stdin.read(1)
+                    except (EOFError, OSError):
+                        pass
+                    continue
+                if ch == "\t":
+                    continue  # ignore tab for now
+                # Printable char — append to the live input buffer.
+                if ch.isprintable():
+                    self._live_input += ch
+        finally:
+            # Restore terminal state.
+            if old_settings is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _run_live(self) -> None:
         """Run the game in live-dashboard mode with rich.live.Live.
@@ -3460,6 +3604,9 @@ class GameREPL:
             "banner": "banner",
             "plugins": "plugins",
             "quit": "quit", "q": "quit", "exit": "quit",
+            "respawn": "respawn",
+            "memory": "memory", "mem": "memory",
+            "schedule": "schedule", "sched": "schedule",
             "fish": "fish",
             "craft": "craft",
             "recipes": "recipes",
