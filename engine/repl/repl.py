@@ -1,4 +1,4 @@
-"""Game REPL — a polished interactive command-line interface.
+"""Game REPL — a polished, dynamic interactive command-line interface.
 
 This module is the SINGLE entry point for Aeon Engine. It replaces the
 old ``main.py`` and integrates EVERY gameplay system the engine ships
@@ -9,27 +9,21 @@ themes, dimensions, body parts, trade, bookmarks, procedural dialogue,
 all combat variants (naval / siege / aerial / space / realtime /
 mounted), background simulation, content packs, plugins and more.
 
-Features
---------
-* Single-key movement (hjkl, wasd, arrows) — no Enter required (TTY).
-* Full command parser with aliases, autocomplete and history.
-* Pretty formatted output with ANSI 256-colour support.
-* Combat, magic, inventory, dialogue, crafting all fully playable.
-* In-game help system organised by category.
-* Macros and command aliases.
-* Graceful fall-back to line mode when stdin is not a TTY (pipes, CI).
-
-Movement keys (vi-style)
-------------------------
-  h/←   west      j/↓   south     k/↑   north     l/→   east
-  y     NW        u     NE        b     SW        n     SE
-  .     wait      >     descend   <     ascend
-
-Other single-key actions
-------------------------
-  i     inventory       c     character sheet
-  m     world map       ?     help
-  q     quit            Esc   cancel/close panel
+UI design (rich-based)
+-----------------------
+* Persistent three-panel layout:
+    - Status panel (HP/MP/needs/wealth/time/weather)
+    - Map panel (local viewport with entities)
+    - Messages panel (recent message log)
+* Command output panel — surfaces inventory, character sheet, help, etc.
+  and persists across the next refresh so the player can actually read it.
+* Big banner shown at startup and on demand via the ``banner`` command.
+* Pretty formatted output using rich Panels, Tables, Bars and Rules.
+* Colour-rich logs that go to a log file by default (the console is
+  reserved for the game UI).
+* Graceful fall-back to plain line mode when stdin is not a TTY (pipes,
+  CI environments) — the rich layout is replaced with a flat render
+  that still shows every panel.
 
 Run the game
 ------------
@@ -62,6 +56,18 @@ from engine.render.terminal import Color, ANSI
 from engine.ui.screens import MessageLog
 
 
+# rich is a hard dependency of the REPL UI.
+from rich.align import Align
+from rich.console import Console, Group, RenderableType
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+
 log = get_logger("repl")
 
 
@@ -70,7 +76,6 @@ log = get_logger("repl")
 # --------------------------------------------------------------------------- #
 
 DIRECTIONS: dict[str, tuple[int, int, str]] = {
-    # vi-keys
     "h": (-1, 0, "west"),  "left":  (-1, 0, "west"),  "west":  (-1, 0, "west"),
     "l": (1, 0, "east"),   "right": (1, 0, "east"),   "east":  (1, 0, "east"),
     "k": (0, -1, "north"), "up":    (0, -1, "north"), "north": (0, -1, "north"),
@@ -79,7 +84,6 @@ DIRECTIONS: dict[str, tuple[int, int, str]] = {
     "u": (1, -1, "NE"),    "northeast": (1, -1, "NE"),
     "b": (-1, 1, "SW"),    "southwest": (-1, 1, "SW"),
     "n": (1, 1, "SE"),     "southeast": (1, 1, "SE"),
-    # wasd
     "a": (-1, 0, "west"),  "d": (1, 0, "east"),
     "w": (0, -1, "north"), "s": (0, 1, "south"),
 }
@@ -98,12 +102,6 @@ SINGLE_KEYS: dict[str, str] = {
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def _colour(text: str, color: Optional[int], enabled: bool) -> str:
-    if color is not None and enabled:
-        return f"\033[38;5;{color}m{text}\033[0m"
-    return text
-
-
 def _format_money(copper_total: int) -> str:
     """Format a copper amount as gold/silver/copper."""
     if copper_total < 0:
@@ -117,6 +115,24 @@ def _format_money(copper_total: int) -> str:
         parts.append(f"{silver}s")
     parts.append(f"{copper}c")
     return " ".join(parts)
+
+
+def _ansi_to_text(s: str) -> str:
+    """Strip ANSI escape codes from a string."""
+    import re
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def _make_bar(current: float, maximum: float, width: int = 16,
+              fill_char: str = "█", empty_char: str = "░") -> str:
+    """Return a textual progress bar."""
+    if maximum <= 0:
+        fraction = 0.0
+    else:
+        fraction = current / maximum
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(width * fraction)
+    return fill_char * filled + empty_char * (width - filled)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,25 +149,49 @@ class GameREPL:
         self.running: bool = False
         self._history: list[str] = []
         self._history_idx: int = -1
-        self._current_input: str = ""
         self._in_dialogue: bool = False
         self._dialogue_ctx: Any = None
         self._dialogue_tree: Any = None
         self._raw_mode: bool = False
         self._saved_term_settings: Any = None
-        self._panel_buffer: list[str] = []  # one-off display output
 
-        # Lazily-instantiated non-Engine systems, created on first use so we
-        # don't pay the cost for players who never touch them.
+        # The current "command output" panel — persists until the next
+        # command produces new output. This is the key fix for the
+        # "inventory shows nothing" bug.
+        self._command_output: Optional[RenderableType] = None
+        self._command_output_title: str = "Welcome"
+
+        # Backwards-compat: legacy tests introspect `_panel_buffer` after
+        # running `_execute_command`. We populate it with the plain-text
+        # rendering of the most recent command output.
+        self._panel_buffer: list[str] = []
+
+        # Lazily-instantiated non-Engine systems.
         self._extras: dict[str, Any] = {}
 
-        # Cache whether colour is enabled.
+        # Rich console — configured for the game UI.
         self._color: bool = bool(getattr(self.engine.config.ui, "color_enabled", True))
+        self.console: Console = Console(
+            force_terminal=self._is_tty(),
+            color_system="auto" if self._color else None,
+            highlight=False,
+            soft_wrap=False,
+            width=max(80, min(120, os.get_terminal_size().columns if self._is_tty() else 100)),
+        )
 
-    # ----- lazy extra-system accessors ------------------------------------ #
+        # Whether we have a real TTY for input (raw mode).
+        self._interactive: bool = self._is_tty()
+
+    # ----- terminal helpers ----------------------------------------------- #
+
+    @staticmethod
+    def _is_tty() -> bool:
+        try:
+            return sys.stdin.isatty() and sys.stdout.isatty()
+        except Exception:  # noqa: BLE001
+            return False
 
     def _extra(self, key: str, factory: Any) -> Any:
-        """Get-or-create an auxiliary system not owned by the Engine."""
         if key not in self._extras:
             try:
                 self._extras[key] = factory()
@@ -159,6 +199,8 @@ class GameREPL:
                 log.error("Failed to initialise system %s: %s", key, exc)
                 return None
         return self._extras[key]
+
+    # ----- lazy extra-system accessors ------------------------------------ #
 
     @property
     def stealth(self):
@@ -301,23 +343,20 @@ class GameREPL:
             "engine.background_sim.system",
             fromlist=["BackgroundSimulator"]).BackgroundSimulator(self.engine.rng))
 
-    # ----- terminal setup -------------------------------------------------- #
+    # ----- raw-mode terminal setup ---------------------------------------- #
 
     def enable_raw_mode(self) -> None:
-        """Enable raw terminal mode for single-key input."""
         try:
             import termios
             import tty
             self._saved_term_settings = termios.tcgetattr(sys.stdin.fileno())
             tty.setraw(sys.stdin.fileno())
             self._raw_mode = True
-        except Exception:  # noqa: BLE001 — termios.error, ImportError, OSError, AttributeError…
-            # Not a TTY or not Unix — fall back to line mode.
+        except Exception:  # noqa: BLE001
             self._raw_mode = False
             self._saved_term_settings = None
 
     def disable_raw_mode(self) -> None:
-        """Restore terminal settings."""
         if self._saved_term_settings is not None:
             try:
                 import termios
@@ -330,10 +369,9 @@ class GameREPL:
         self._saved_term_settings = None
 
     def _read_key(self) -> str:
-        """Read a single keypress in raw mode."""
         try:
             ch = sys.stdin.read(1)
-            if ch == "\x1b":  # escape sequence
+            if ch == "\x1b":
                 ch2 = sys.stdin.read(1)
                 if ch2 == "[":
                     ch3 = sys.stdin.read(1)
@@ -354,58 +392,71 @@ class GameREPL:
                 return "tab"
             if ch == "\x7f" or ch == "\x08":
                 return "backspace"
-            if ch == "\x03":  # Ctrl-C
+            if ch == "\x03":
                 return "quit"
-            if ch == "\x04":  # Ctrl-D
+            if ch == "\x04":
                 return "quit"
             return ch
         except (EOFError, KeyboardInterrupt):
             return "quit"
 
-    # ----- output ---------------------------------------------------------- #
-
-    def print(self, text: str = "", color: Optional[int] = None,
-              end: str = "\n") -> None:
-        """Print coloured text — buffered if a panel is active."""
-        line = _colour(text, color, self._color)
-        if end == "\n":
-            self._panel_buffer.append(line)
-        else:
-            if self._panel_buffer:
-                self._panel_buffer[-1] += line
-            else:
-                self._panel_buffer.append(line)
-
-    def print_header(self, text: str, color: int = Color.GOLD) -> None:
-        width = 60
-        line = "═" * width
-        self.print(f"\n{text.center(width)}", color=color)
-        self.print(line, color=color)
-
-    def print_separator(self, color: int = Color.GRAY) -> None:
-        self.print("─" * 60, color=color)
-
-    def print_bar(self, label: str, current: float, maximum: float,
-                  width: int = 20, color: int = Color.HEALTH) -> None:
-        if maximum <= 0:
-            fraction = 0
-        else:
-            fraction = current / maximum
-        fraction = max(0.0, min(1.0, fraction))
-        filled = int(width * fraction)
-        bar = "█" * filled + "░" * (width - filled)
-        self.print(f"  {label:12s} [{bar}] {int(current)}/{int(maximum)}",
-                   color=color)
+    # ----- output & message helpers --------------------------------------- #
 
     def msg(self, text: str, color: int = Color.WHITE) -> None:
-        """Add a message to the engine message log."""
+        """Add a message to the engine message log (shown in messages panel)."""
         self.engine.message_log.add(text, color)
 
-    # ----- game-state display --------------------------------------------- #
+    def set_output(self, renderable: RenderableType, title: str = "Output") -> None:
+        """Set the persistent command-output panel."""
+        self._command_output = renderable
+        self._command_output_title = title
+        # Backwards-compat: render the rich object to plain text so legacy
+        # tests that inspect `_panel_buffer` can still find keywords.
+        try:
+            from io import StringIO
+            buf = StringIO()
+            tmp_console = Console(
+                file=buf, force_terminal=False, color_system=None,
+                highlight=False, soft_wrap=True, width=100,
+            )
+            tmp_console.print(renderable)
+            self._panel_buffer = buf.getvalue().splitlines()
+        except Exception:  # noqa: BLE001
+            self._panel_buffer = [str(renderable)]
 
-    def show_status_panel(self) -> None:
+    def clear_output(self) -> None:
+        self._command_output = None
+        self._command_output_title = ""
+        self._panel_buffer = []
+
+    # ----- rich panel builders -------------------------------------------- #
+
+    def _banner_panel(self) -> Panel:
+        banner_text = Text()
+        banner_text.append("╔══════════════════════════════════════════════════════════╗\n",
+                           style="bold gold1")
+        banner_text.append("║                                                          ║\n",
+                           style="bold gold1")
+        banner_text.append("║            A E O N   E N G I N E                         ║\n",
+                           style="bold gold1")
+        banner_text.append("║       A Text-Based Open-World RPG                        ║\n",
+                           style="bold gold1")
+        banner_text.append("║                                                          ║\n",
+                           style="bold gold1")
+        banner_text.append("╚══════════════════════════════════════════════════════════╝\n",
+                           style="bold gold1")
+        banner_text.append("\nType 'help' for commands, 'q' to quit.", style="cyan")
+        if self._raw_mode:
+            banner_text.append("  hjkl/wasd/arrows move.", style="cyan")
+        else:
+            banner_text.append("  Line mode: type a command and press Enter.", style="cyan")
+        return Panel(banner_text, border_style="gold1", title="[bold gold1]Aeon Engine[/]",
+                     expand=True)
+
+    def _status_panel(self) -> Panel:
         if self.engine.player is None:
-            return
+            return Panel(Text("No player.", style="red"), title="[bold]Status[/]",
+                         border_style="red")
         player = self.engine.player
         world = self.engine.world
         identity = world.get_component(player, Identity)
@@ -416,187 +467,171 @@ class GameREPL:
         position = world.get_component(player, Position)
         mana = world.get_component(player, Mana)
         name = identity.display_name if identity else "Hero"
-        self.print_header(name, Color.GOLD)
+
+        # Build the status body as a Table for clean column alignment.
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column()
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column()
+
         if health:
-            self.print_bar("HP", health.current, health.maximum, color=Color.HEALTH)
+            hp_bar = _make_bar(health.current, health.maximum)
+            table.add_row("HP", f"[red]{hp_bar}[/] {int(health.current)}/{int(health.maximum)}",
+                          "", "")
         if mana:
-            self.print_bar("MP", mana.current, mana.maximum, color=Color.MANA)
+            mp_bar = _make_bar(mana.current, mana.maximum)
+            table.add_row("MP", f"[blue]{mp_bar}[/] {mana.current:.0f}/{mana.maximum:.0f}",
+                          "", "")
         if needs:
-            self.print_bar("Hunger", needs.hunger, 100, color=Color.YELLOW)
-            self.print_bar("Thirst", needs.thirst, 100, color=Color.CYAN)
-            self.print_bar("Fatigue", needs.fatigue, 100, color=Color.MUTED)
-            self.print_bar("Sleep", needs.sleep, 100, color=Color.PURPLE)
+            table.add_row("Hunger", f"[yellow]{_make_bar(needs.hunger, 100)}[/] {int(needs.hunger)}/100",
+                          "Thirst", f"[cyan]{_make_bar(needs.thirst, 100)}[/] {int(needs.thirst)}/100")
+            table.add_row("Fatigue", f"[grey]{_make_bar(needs.fatigue, 100)}[/] {int(needs.fatigue)}/100",
+                          "Sleep", f"[magenta]{_make_bar(needs.sleep, 100)}[/] {int(needs.sleep)}/100")
         if position:
-            self.print(f"  Position: ({position.x}, {position.y})", Color.GRAY)
+            table.add_row("Pos", f"({position.x}, {position.y})", "", "")
         if wealth:
-            self.print(f"  Gold: {wealth.gold}  Silver: {wealth.silver}  Copper: {wealth.copper}",
-                       color=Color.GOLD)
+            table.add_row("Wealth", f"[gold1]{_format_money(wealth.total_copper())}[/]", "", "")
         try:
             time_str = self.engine.clock.time.display()
             weather_str = (self.engine.weather.current.description()
                            if self.engine.weather else "unknown")
-            self.print(f"  {time_str} | {weather_str}", Color.CYAN)
+            table.add_row("Time", f"[cyan]{time_str}[/]", "", "")
+            table.add_row("Weather", f"[cyan]{weather_str}[/]", "", "")
         except Exception:  # noqa: BLE001
             pass
-        self.print_separator()
+        return Panel(table, title=f"[bold gold1]{name}[/]", border_style="gold1", expand=True)
 
-    def show_map_view(self, radius: int = 12) -> None:
+    def _map_panel(self) -> Panel:
         if self.engine.player is None or self.engine.world_map is None:
-            return
+            return Panel(Text("No map.", style="red"), title="[bold]Map[/]",
+                         border_style="red")
         player = self.engine.player
         pos = self.engine.world.get_component(player, Position)
         if pos is None:
-            return
+            return Panel(Text("No position.", style="red"), title="[bold]Map[/]",
+                         border_style="red")
         world_map = self.engine.world_map
         viewport_w = min(50, world_map.width)
         viewport_h = min(15, world_map.height)
         ox = pos.x - viewport_w // 2
         oy = pos.y - viewport_h // 2
-        self.print_header("Map", Color.GOLD)
+        lines: list[Text] = []
         for j in range(viewport_h):
-            row = ""
+            row = Text()
             for i in range(viewport_w):
                 wx = ox + i
                 wy = oy + j
                 tile = world_map.get_tile(wx, wy)
                 if tile is None:
-                    row += " "
+                    row.append(" ")
                     continue
                 if not tile.is_explored and not self.engine.cheat_mode:
-                    row += " "
+                    row.append(" ")
                     continue
                 entity_here = False
                 for ent, (ep,) in self.engine.world.view(Position):
                     if ep.x == wx and ep.y == wy:
                         if ent.id == player.id:
-                            row += "@"
+                            row.append("@", style="bold yellow")
                             entity_here = True
                             break
                         identity = self.engine.world.get_component(ent, Identity)
                         glyph = identity.glyph if identity else "?"
-                        row += glyph
+                        color = "red" if self.engine.world.has_tag(ent, "hostile") else "white"
+                        row.append(glyph, style=color)
                         entity_here = True
                         break
                 if not entity_here:
-                    row += tile.terrain.glyph
-            self.print(row)
-        self.print_separator()
+                    row.append(tile.terrain.glyph)
+            lines.append(row)
+        return Panel(Group(*lines), title="[bold]Map[/]", border_style="cyan", expand=True)
 
-    def show_messages(self, n: int = 5) -> None:
-        if not self.engine.message_log.messages:
-            return
-        self.print_header("Messages", Color.GOLD)
-        for msg, color in self.engine.message_log.recent(n):
-            self.print(f"  {msg}", color=color)
-        self.print_separator()
-
-    def show_inventory(self) -> None:
-        if self.engine.player is None:
-            return
-        inv = self.engine.inventories.get(self.engine.player.id)
-        if inv is None:
-            self.print("You have no inventory.", Color.GRAY)
-            return
-        self.print_header("Inventory", Color.GOLD)
-        self.print("Equipment:", Color.YELLOW)
-        for slot, item_id in inv.all_equipped().items():
-            if item_id is None:
-                self.print(f"  {slot.value:15s} (empty)", Color.GRAY)
-            else:
-                item = self.engine.items.get(item_id)
-                if item:
-                    self.print(f"  {slot.value:15s} {item.display_name}",
-                               color=item.rarity.color)
-        self.print()
-        self.print("Backpack:", Color.YELLOW)
-        any_items = False
-        for slot_idx, item, count in inv.iter_items(self.engine.items):
-            any_items = True
-            line = f"  [{slot_idx:2d}] {item.display_name}"
-            if count > 1:
-                line += f" x{count}"
-            line += f"  ({item.weight:.1f}kg, {item.total_value}cp)"
-            self.print(line, color=item.rarity.color)
-        if not any_items:
-            self.print("  (empty)", Color.GRAY)
-        weight = inv.total_weight(self.engine.items)
-        self.print(f"\nTotal weight: {weight:.1f}/{inv.max_weight:.1f} kg",
-                   color=Color.GRAY)
-        self.print_separator()
-
-    def show_character_sheet(self) -> None:
-        if self.engine.player is None:
-            return
-        player = self.engine.player
-        identity = self.engine.world.get_component(player, Identity)
-        health = self.engine.world.get_component(player, Health)
-        stats = self.engine.world.get_component(player, Stats)
-        race = self.engine.world.get_component(player, Race)
-        wealth = self.engine.world.get_component(player, Wealth)
-        self.print_header("Character", Color.GOLD)
-        if identity:
-            self.print(f"  Name: {identity.display_name}", Color.WHITE)
-            if identity.description:
-                self.print(f"  Description: {identity.description}", Color.GRAY)
-        if race:
-            self.print(f"  Race: {race.race_id.title()}  Age: {race.age}",
-                       color=Color.WHITE)
-        if health:
-            self.print(f"  HP: {health.current}/{health.maximum}", Color.HEALTH)
-        if wealth:
-            self.print(f"  Wealth: {_format_money(wealth.total_copper())}",
-                       color=Color.GOLD)
-        if stats:
-            self.print()
-            self.print("  Attributes:", Color.YELLOW)
-            for attr in ("strength", "agility", "endurance", "intelligence",
-                         "willpower", "charisma", "perception", "luck"):
-                val = getattr(stats, attr)
-                self.print(f"    {attr:14s}: {val}", Color.WHITE)
-            self.print()
-            self.print("  Derived:", Color.YELLOW)
-            derived = stats.derived()
-            for k, v in derived.items():
-                self.print(f"    {k:18s}: {v}", Color.WHITE)
-        self.print_separator()
-
-    def show_spells(self) -> None:
-        from engine.magic.spells import SpellLibrary
-        self.print_header("Spells", Color.GOLD)
-        mana = (self.engine.world.get_component(self.engine.player, Mana)
-                if self.engine.player else None)
-        if mana:
-            self.print(f"  MP: {mana.current:.0f}/{mana.maximum:.0f}", Color.MANA)
-            self.print()
-        spells = list(SpellLibrary.all())
-        if not spells:
-            self.print("  No spells are known to exist.", Color.GRAY)
-        for spell in spells:
-            line = f"  {spell.name:25s} cost: {spell.mana_cost:3d} MP"
-            if spell.target.value != "self":
-                line += f"  ({spell.target.value})"
-            self.print(line, color=Color.MANA)
-        self.print_separator()
-
-    def show_skills(self) -> None:
-        from engine.entities.components import Skills as SkillsComp
-        from engine.skills.system import SkillLibrary
-        comp = (self.engine.world.get_component(self.engine.player, SkillsComp)
-                if self.engine.player else None)
-        self.print_header("Skills", Color.GOLD)
-        if comp is None or not comp.skills:
-            self.print("  You have no skills yet.", Color.GRAY)
-            self.print("  Try: train <skill> with self", Color.GRAY)
+    def _messages_panel(self) -> Panel:
+        msgs = self.engine.message_log.messages[-8:] if self.engine.message_log.messages else []
+        if not msgs:
+            body = Text("(no messages)", style="dim")
         else:
-            for skill_id, sl in sorted(comp.skills.items(),
-                                        key=lambda x: -x[1].level):
-                skill = SkillLibrary.get(skill_id)
-                name = skill.name if skill else skill_id
-                self.print(f"  {name:25s} Lv: {sl.level:3d}  XP: {sl.xp:.0f}",
-                           color=Color.WHITE)
-        self.print_separator()
+            lines: list[Text] = []
+            color_map = {
+                Color.RED: "red",
+                Color.GREEN: "green",
+                Color.YELLOW: "yellow",
+                Color.CYAN: "cyan",
+                Color.GOLD: "gold1",
+                Color.MANA: "blue",
+                Color.GRAY: "dim",
+                Color.WHITE: "white",
+            }
+            for msg, color in msgs:
+                style = color_map.get(color, "white")
+                lines.append(Text(f"• {msg}", style=style))
+            body = Group(*lines)
+        return Panel(body, title="[bold]Messages[/]", border_style="green", expand=True)
 
-    # ----- movement & look ------------------------------------------------- #
+    def _command_output_panel(self) -> Optional[Panel]:
+        if self._command_output is None:
+            return None
+        return Panel(
+            self._command_output,
+            title=f"[bold magenta]{self._command_output_title}[/]",
+            border_style="magenta",
+            expand=True,
+        )
+
+    # ----- top-level render ------------------------------------------------ #
+
+    def _render(self) -> None:
+        """Render the full game UI."""
+        self.console.clear()
+        # Banner always visible at top.
+        self.console.print(self._banner_panel())
+        # Status + Map side-by-side if terminal is wide enough.
+        try:
+            width = self.console.width
+        except Exception:  # noqa: BLE001
+            width = 80
+        if width >= 100:
+            from rich.columns import Columns
+            cols = Columns([self._status_panel(), self._map_panel()], expand=True, equal=True)
+            self.console.print(cols)
+        else:
+            self.console.print(self._status_panel())
+            self.console.print(self._map_panel())
+        # Messages always visible.
+        self.console.print(self._messages_panel())
+        # Command output (inventory, help, etc.) — persists across refreshes.
+        out_panel = self._command_output_panel()
+        if out_panel is not None:
+            self.console.print(out_panel)
+        # Dialogue overlay if active.
+        if self._in_dialogue:
+            self._render_dialogue()
+        # Prompt.
+        if self._in_dialogue:
+            self.console.print("[bold yellow]Choice>[/] ", end="")
+        else:
+            self.console.print("[bold green]>[/] ", end="")
+
+    def _render_dialogue(self) -> None:
+        if self._dialogue_tree is None or self._dialogue_ctx is None:
+            return
+        node = self._dialogue_tree.get(self._dialogue_ctx.current_node_id)
+        if node is None:
+            return
+        identity = self.engine.world.get_component(self._dialogue_ctx.npc, Identity)
+        npc_name = identity.display_name if identity else "NPC"
+        body = Text()
+        body.append(f"{npc_name}: ", style="bold yellow")
+        body.append(node.speaker_text, style="white")
+        body.append("\n\nChoices:\n", style="dim")
+        for i, choice in enumerate(node.choices):
+            body.append(f"  [{i + 1}] {choice.text}\n", style="white")
+        body.append("  [0] End conversation", style="dim")
+        self.console.print(Panel(body, title=f"[bold yellow]Conversation with {npc_name}[/]",
+                                 border_style="yellow"))
+
+    # ----- game-state display commands ------------------------------------ #
 
     def cmd_look(self, args: list[str]) -> None:
         if self.engine.player is None or self.engine.world_map is None:
@@ -610,13 +645,13 @@ class GameREPL:
             if target is not None:
                 self._describe_entity(target)
                 return
-            self.print(f"You don't see any '{' '.join(args)}' here.", Color.GRAY)
+            self.msg(f"You don't see any '{' '.join(args)}' here.", Color.GRAY)
             return
-        self.print_header("You see...", Color.GOLD)
+        body_lines: list[Text] = []
         tile = self.engine.world_map.get_tile(pos.x, pos.y)
         if tile:
             biome_name = tile.biome_type.replace("_", " ").title()
-            self.print(f"  Terrain: {tile.terrain.glyph} {biome_name}", Color.GRAY)
+            body_lines.append(Text(f"Terrain: {tile.terrain.glyph} {biome_name}", style="dim"))
         any_entity = False
         for ent, (ep,) in self.engine.world.view(Position):
             if ent.id == player.id:
@@ -627,45 +662,51 @@ class GameREPL:
             identity = self.engine.world.get_component(ent, Identity)
             name = identity.display_name if identity else f"entity#{ent.id}"
             glyph = identity.glyph if identity else "?"
-            tag = ""
             if self.engine.world.has_tag(ent, "hostile"):
+                style = "red"
                 tag = " (hostile)"
-                color = Color.RED
             elif self.engine.world.has_tag(ent, "npc"):
+                style = "yellow"
                 tag = " (NPC)"
-                color = Color.YELLOW
             else:
-                color = Color.WHITE
-            self.print(f"  {glyph} {name}{tag} at ({ep.x}, {ep.y}) — dist {dist}",
-                       color=color)
+                style = "white"
+                tag = ""
+            body_lines.append(Text(f"{glyph} {name}{tag} at ({ep.x}, {ep.y}) — dist {dist}",
+                                   style=style))
             any_entity = True
         if not any_entity:
-            self.print("  Nothing of interest nearby.", Color.GRAY)
-        self.print_separator()
+            body_lines.append(Text("Nothing of interest nearby.", style="dim"))
+        self.set_output(Group(*body_lines), title="You see...")
 
     def cmd_go(self, args: list[str]) -> None:
         if not args:
-            self.print("Go where? Try: go north (or just: k)", Color.GRAY)
+            self.set_output(Text("Go where? Try: go north (or just: k)", style="dim"),
+                            title="Move")
             return
         direction = args[0].lower()
         if direction not in DIRECTIONS:
-            self.print(f"Unknown direction: {direction}", Color.RED)
-            self.print(f"Valid: {', '.join(sorted(set(DIRECTIONS.keys())))}",
-                       color=Color.GRAY)
+            self.set_output(
+                Text(f"Unknown direction: {direction}\nValid: {', '.join(sorted(set(DIRECTIONS.keys())))}",
+                     style="red"),
+                title="Move")
             return
         dx, dy, name = DIRECTIONS[direction]
         self.engine.move_player(dx, dy)
+        # Clear command output so movement shows the world.
+        self.clear_output()
 
     def cmd_attack(self, args: list[str]) -> None:
         if not args:
             target = self._find_adjacent_hostile()
             if target is None:
-                self.print("Attack what? Try: attack goblin", Color.GRAY)
+                self.set_output(Text("Attack what? Try: attack goblin", style="dim"),
+                                title="Attack")
                 return
         else:
             target = self._find_entity_by_name(" ".join(args))
             if target is None:
-                self.print(f"You don't see any '{' '.join(args)}' here.", Color.RED)
+                self.set_output(Text(f"You don't see any '{' '.join(args)}' here.",
+                                     style="red"), title="Attack")
                 return
         if target is None:
             return
@@ -675,7 +716,8 @@ class GameREPL:
             dist = max(abs(player_pos.x - target_pos.x),
                        abs(player_pos.y - target_pos.y))
             if dist > 1:
-                self.print("Target is too far away.", Color.RED)
+                self.set_output(Text("Target is too far away.", style="red"),
+                                title="Attack")
                 return
         comp = self.engine.world.get_component(self.engine.player, CombatComp)
         weapon = None
@@ -694,8 +736,7 @@ class GameREPL:
     def cmd_cast(self, args: list[str]) -> None:
         from engine.magic.spells import SpellLibrary
         if not args:
-            self.print("Cast what? Try: cast fireball", Color.GRAY)
-            self.show_spells()
+            self.cmd_spells([])
             return
         spell_name = " ".join(args).lower()
         spell = None
@@ -707,7 +748,8 @@ class GameREPL:
                 spell = s
                 break
         if spell is None:
-            self.print(f"Unknown spell: {spell_name}", Color.RED)
+            self.set_output(Text(f"Unknown spell: {spell_name}", style="red"),
+                            title="Cast")
             return
         target = None
         if spell.target.value in ("enemy", "ally", "item"):
@@ -728,18 +770,17 @@ class GameREPL:
             self.engine.message_log.add(
                 f"  Restored {result.healing_done:.0f} HP!", Color.GREEN,
             )
-        if result.killed_targets if hasattr(result, 'killed_targets') else False:
-            for dead in getattr(result, 'killed_targets', []):
+        if hasattr(result, 'killed_targets') and result.killed_targets:
+            for dead in result.killed_targets:
                 self.engine._handle_death(dead, self.engine.player)
 
     def cmd_research(self, args: list[str]) -> None:
-        """Start a spell-research project: research <name> <school_id>."""
         if len(args) < 2:
-            self.print("Usage: research <name> <school_id>", Color.GRAY)
-            self.print("Schools: evocation, conjuration, enchantment, necromancy,",
-                       color=Color.GRAY)
-            self.print("         abjuration, transmutation, divination, illusion",
-                       color=Color.GRAY)
+            self.set_output(Text(
+                "Usage: research <name> <school_id>\n"
+                "Schools: evocation, conjuration, enchantment, necromancy, "
+                "abjuration, transmutation, divination, illusion",
+                style="dim"), title="Research")
             return
         name = args[0]
         school_id = args[1]
@@ -752,13 +793,13 @@ class GameREPL:
                  Color.GRAY)
 
     def cmd_meditate(self, args: list[str]) -> None:
-        """Advance research by meditating for some hours (default 1)."""
         hours = 1.0
         if args:
             try:
                 hours = float(args[0])
             except ValueError:
-                self.print("Usage: meditate [hours]", Color.GRAY)
+                self.set_output(Text("Usage: meditate [hours]", style="dim"),
+                                title="Meditate")
                 return
         from engine.entities.components import Skills as SkillsComp
         comp = self.engine.world.get_component(self.engine.player, SkillsComp)
@@ -776,18 +817,20 @@ class GameREPL:
 
     def cmd_schools(self, args: list[str]) -> None:
         from engine.magic.schools import SchoolLibrary
-        self.print_header("Magic Schools", Color.GOLD)
+        table = Table(title="Magic Schools", border_style="blue", show_lines=False)
+        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("Name", style="white")
+        table.add_column("Description", style="dim")
         for s in SchoolLibrary.all():
-            self.print(f"  {s.id:15s} {s.name}", Color.MANA)
-            if s.description:
-                self.print(f"    {s.description}", Color.GRAY)
-        self.print_separator()
+            table.add_row(s.id, s.name, s.description or "")
+        self.set_output(table, title="Magic Schools")
 
     # ----- items & inventory ---------------------------------------------- #
 
     def cmd_use(self, args: list[str]) -> None:
         if not args:
-            self.print("Use what? Try: use health potion", Color.GRAY)
+            self.set_output(Text("Use what? Try: use health potion", style="dim"),
+                            title="Use")
             return
         item_name = " ".join(args).lower()
         inv = self.engine.inventories.get(self.engine.player.id)
@@ -797,7 +840,8 @@ class GameREPL:
             if item_name in item.display_name.lower() or item_name in item.name.lower():
                 self._use_item(item)
                 return
-        self.print(f"You don't have any '{item_name}'.", Color.RED)
+        self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                        title="Use")
 
     def _use_item(self, item: Any) -> None:
         from engine.entities.components import Needs as NeedsComp
@@ -810,43 +854,37 @@ class GameREPL:
                 health = self.engine.world.get_component(self.engine.player, Health)
                 if health:
                     health.current = min(health.maximum, int(health.current + heal))
-                    self.engine.message_log.add(
-                        f"You use {item.display_name}, restoring {heal:.0f} HP.",
-                        Color.GREEN,
-                    )
+                    self.msg(f"You use {item.display_name}, restoring {heal:.0f} HP.",
+                             Color.GREEN)
             if mana_restore > 0:
                 mana = self.engine.world.get_component(self.engine.player, Mana)
                 if mana:
                     mana.current = min(mana.maximum, mana.current + mana_restore)
-                    self.engine.message_log.add(
-                        f"You use {item.display_name}, restoring {mana_restore:.0f} MP.",
-                        Color.MANA,
-                    )
+                    self.msg(f"You use {item.display_name}, restoring {mana_restore:.0f} MP.",
+                             Color.MANA)
             if food > 0:
                 needs = self.engine.world.get_component(self.engine.player, NeedsComp)
                 if needs:
                     needs.hunger = max(0, needs.hunger - food)
-                    self.engine.message_log.add(
-                        f"You eat {item.display_name}. Hunger reduced by {food:.0f}.",
-                        Color.YELLOW,
-                    )
+                    self.msg(f"You eat {item.display_name}. Hunger reduced by {food:.0f}.",
+                             Color.YELLOW)
             if drink > 0:
                 needs = self.engine.world.get_component(self.engine.player, NeedsComp)
                 if needs:
                     needs.thirst = max(0, needs.thirst - drink)
-                    self.engine.message_log.add(
-                        f"You drink {item.display_name}. Thirst reduced by {drink:.0f}.",
-                        Color.CYAN,
-                    )
+                    self.msg(f"You drink {item.display_name}. Thirst reduced by {drink:.0f}.",
+                             Color.CYAN)
             inv = self.engine.inventories.get(self.engine.player.id)
             if inv:
                 inv.remove(item.id, 1)
         else:
-            self.print(f"You can't use {item.display_name}.", Color.GRAY)
+            self.set_output(Text(f"You can't use {item.display_name}.", style="dim"),
+                            title="Use")
 
     def cmd_equip(self, args: list[str]) -> None:
         if not args:
-            self.print("Equip what? Try: equip dagger", Color.GRAY)
+            self.set_output(Text("Equip what? Try: equip dagger", style="dim"),
+                            title="Equip")
             return
         item_name = " ".join(args).lower()
         inv = self.engine.inventories.get(self.engine.player.id)
@@ -865,9 +903,7 @@ class GameREPL:
                         if old:
                             inv.add(old, 1)
                     comp.weapon_id = item.id
-                    self.engine.message_log.add(
-                        f"You equip {item.display_name}.", Color.GREEN,
-                    )
+                    self.msg(f"You equip {item.display_name}.", Color.GREEN)
                     return
                 elif item.category == "armor":
                     comp = self.engine.world.get_component(self.engine.player, CombatComp)
@@ -882,18 +918,18 @@ class GameREPL:
                         if old:
                             inv.add(old, 1)
                     comp.armor_ids[slot_name] = item.id
-                    self.engine.message_log.add(
-                        f"You equip {item.display_name}.", Color.GREEN,
-                    )
+                    self.msg(f"You equip {item.display_name}.", Color.GREEN)
                     return
                 else:
-                    self.print(f"You can't equip {item.display_name}.", Color.GRAY)
+                    self.set_output(Text(f"You can't equip {item.display_name}.",
+                                         style="dim"), title="Equip")
                     return
-        self.print(f"You don't have any '{item_name}'.", Color.RED)
+        self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                        title="Equip")
 
     def cmd_drop(self, args: list[str]) -> None:
         if not args:
-            self.print("Drop what?", Color.GRAY)
+            self.set_output(Text("Drop what?", style="dim"), title="Drop")
             return
         item_name = " ".join(args).lower()
         inv = self.engine.inventories.get(self.engine.player.id)
@@ -905,11 +941,10 @@ class GameREPL:
                 pos = self.engine.world.get_component(self.engine.player, Position)
                 if pos:
                     self.engine.factory.create_item_entity(item.id, pos.x, pos.y)
-                self.engine.message_log.add(
-                    f"You drop {item.display_name}.", Color.GRAY,
-                )
+                self.msg(f"You drop {item.display_name}.", Color.GRAY)
                 return
-        self.print(f"You don't have any '{item_name}'.", Color.RED)
+        self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                        title="Drop")
 
     def cmd_pickup(self, args: list[str]) -> None:
         if self.engine.player is None:
@@ -942,19 +977,18 @@ class GameREPL:
             inv = self.engine.inventories.get(self.engine.player.id)
             if inv:
                 inv.add(item, 1)
-                self.engine.message_log.add(
-                    f"You pick up {item.display_name}.", Color.GREEN,
-                )
+                self.msg(f"You pick up {item.display_name}.", Color.GREEN)
                 picked_up = True
             self.engine.world.destroy_entity(ent)
         if not picked_up:
-            self.engine.message_log.add("There's nothing to pick up.", Color.GRAY)
+            self.msg("There's nothing to pick up.", Color.GRAY)
 
     def cmd_unequip(self, args: list[str]) -> None:
         comp = (self.engine.world.get_component(self.engine.player, CombatComp)
                 if self.engine.player else None)
         if comp is None:
-            self.print("You have nothing equipped.", Color.GRAY)
+            self.set_output(Text("You have nothing equipped.", style="dim"),
+                            title="Unequip")
             return
         if not args:
             unequipped = False
@@ -973,9 +1007,10 @@ class GameREPL:
                     unequipped = True
                 comp.weapon_id = None
             if unequipped:
-                self.engine.message_log.add("You unequip all items.", Color.GREEN)
+                self.msg("You unequip all items.", Color.GREEN)
             else:
-                self.print("You have nothing equipped.", Color.GRAY)
+                self.set_output(Text("You have nothing equipped.", style="dim"),
+                                title="Unequip")
             return
         slot_name = args[0].lower()
         if slot_name in ("weapon", "main_hand", "hand"):
@@ -985,10 +1020,11 @@ class GameREPL:
                     item = self.engine.items.get(comp.weapon_id)
                     if item:
                         inv.add(item, 1)
-                        self.engine.message_log.add(f"You unequip {item.display_name}.", Color.GREEN)
+                        self.msg(f"You unequip {item.display_name}.", Color.GREEN)
                     comp.weapon_id = None
             else:
-                self.print("You don't have a weapon equipped.", Color.GRAY)
+                self.set_output(Text("You don't have a weapon equipped.", style="dim"),
+                                title="Unequip")
         elif slot_name in ("chest", "armor", "body"):
             if comp.armor_ids.get("chest") is not None:
                 inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
@@ -996,13 +1032,14 @@ class GameREPL:
                     item = self.engine.items.get(comp.armor_ids["chest"])
                     if item:
                         inv.add(item, 1)
-                        self.engine.message_log.add(f"You unequip {item.display_name}.", Color.GREEN)
+                        self.msg(f"You unequip {item.display_name}.", Color.GREEN)
                     comp.armor_ids["chest"] = None
             else:
-                self.print("You don't have chest armor equipped.", Color.GRAY)
+                self.set_output(Text("You don't have chest armor equipped.",
+                                     style="dim"), title="Unequip")
         else:
-            self.print(f"Unknown slot: {slot_name}", Color.GRAY)
-            self.print("Valid slots: weapon, chest", Color.GRAY)
+            self.set_output(Text(f"Unknown slot: {slot_name}\nValid slots: weapon, chest",
+                                 style="dim"), title="Unequip")
 
     # ----- dialogue & trade ----------------------------------------------- #
 
@@ -1012,42 +1049,45 @@ class GameREPL:
         else:
             target = self._find_adjacent_npc()
         if target is None:
-            self.print("There's no one to trade with.", Color.GRAY)
+            self.set_output(Text("There's no one to trade with.", style="dim"),
+                            title="Trade")
             return
         if not self.engine.world.has_tag(target, "merchant"):
             identity = self.engine.world.get_component(target, Identity)
             name = identity.display_name if identity else "them"
-            self.print(f"{name} is not interested in trading.", Color.GRAY)
+            self.set_output(Text(f"{name} is not interested in trading.",
+                                 style="dim"), title="Trade")
             return
         identity = self.engine.world.get_component(target, Identity)
         name = identity.display_name if identity else "Merchant"
-        self.print_header(f"Trading with {name}", Color.GOLD)
         wealth = self.engine.world.get_component(self.engine.player, Wealth)
-        self.print(f"  Your money: {_format_money(wealth.total_copper()) if wealth else '0c'}",
-                   color=Color.GOLD)
-        self.print("  Available goods (use 'buy <good> <qty>'):", Color.YELLOW)
+        body = Text()
+        body.append(f"Trading with {name}\n", style="bold gold1")
+        body.append(f"Your money: {_format_money(wealth.total_copper()) if wealth else '0c'}\n\n",
+                    style="gold1")
+        body.append("Available goods (use 'buy <good> <qty>'):\n", style="yellow")
         from engine.economy.market import TradeGoodLibrary
         for g in list(TradeGoodLibrary.all())[:10]:
-            self.print(f"    {g.id:20s} base {g.base_price}cp  ({g.name})", Color.WHITE)
-        self.print_separator()
+            body.append(f"  {g.id:20s} base {g.base_price}cp  ({g.name})\n", style="white")
+        self.set_output(body, title=f"Trade — {name}")
 
     def cmd_buy(self, args: list[str]) -> None:
         if len(args) < 1:
-            self.print("Usage: buy <good_id> [quantity]", Color.GRAY)
+            self.set_output(Text("Usage: buy <good_id> [quantity]", style="dim"),
+                            title="Buy")
             return
         good_id = args[0]
         qty = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
-        # Use the engine economy's first market if available
         if not self.engine.economy.markets:
             self.engine.economy.create_market("m1", "General Store", (0, 0))
         market = list(self.engine.economy.markets.values())[0]
         wealth = self.engine.world.get_component(self.engine.player, Wealth)
         if wealth is None:
-            self.print("You have no wealth component.", Color.RED)
+            self.set_output(Text("You have no wealth component.", style="red"),
+                            title="Buy")
             return
         bought, cost = market.buy(good_id, qty, wealth.total_copper())
         if bought > 0:
-            # Deduct copper-first, then silver, then gold.
             remaining = cost
             if wealth.copper >= remaining:
                 wealth.copper -= remaining
@@ -1068,12 +1108,12 @@ class GameREPL:
                 wealth.gold = max(0, wealth.gold - cg)
             self.msg(f"You buy {bought}x {good_id} for {cost}cp.", Color.GREEN)
         else:
-            self.msg(f"Could not buy {good_id} (insufficient gold or supply).",
-                     Color.RED)
+            self.msg(f"Could not buy {good_id} (insufficient gold or supply).", Color.RED)
 
     def cmd_sell(self, args: list[str]) -> None:
         if len(args) < 1:
-            self.print("Usage: sell <good_id> [quantity]", Color.GRAY)
+            self.set_output(Text("Usage: sell <good_id> [quantity]", style="dim"),
+                            title="Sell")
             return
         good_id = args[0]
         qty = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
@@ -1091,11 +1131,14 @@ class GameREPL:
         if not self.engine.economy.markets:
             self.engine.economy.create_market("m1", "General Store", (0, 0))
         market = list(self.engine.economy.markets.values())[0]
-        self.print_header(f"Market: {market.name}", Color.GOLD)
+        table = Table(title=f"Market — {market.name}", border_style="gold1")
+        table.add_column("Good ID", style="cyan", no_wrap=True)
+        table.add_column("Name", style="white")
+        table.add_column("Price (cp)", style="gold1", justify="right")
         for g in TradeGoodLibrary.all():
             price = market.price_for(g.id)
-            self.print(f"  {g.id:20s} {price:5d}cp  ({g.name})", Color.WHITE)
-        self.print_separator()
+            table.add_row(g.id, g.name, str(price))
+        self.set_output(table, title=f"Market — {market.name}")
 
     def cmd_talk(self, args: list[str]) -> None:
         from engine.dialogue.system import DialogueEngine, DialogueLibrary
@@ -1104,7 +1147,8 @@ class GameREPL:
         else:
             target = self._find_adjacent_npc()
         if target is None:
-            self.print("There's no one to talk to.", Color.GRAY)
+            self.set_output(Text("There's no one to talk to.", style="dim"),
+                            title="Talk")
             return
         identity = self.engine.world.get_component(target, Identity)
         name = identity.display_name if identity else "stranger"
@@ -1117,7 +1161,6 @@ class GameREPL:
         if tree is None:
             tree = DialogueLibrary.get("commoner_greeting")
         if tree is None:
-            # Use procedural dialogue as a fallback.
             self._procedural_talk(target)
             return
         self._dialogue_tree = tree
@@ -1125,49 +1168,24 @@ class GameREPL:
             self.engine.world, self.engine.player, target, tree,
         )
         self._in_dialogue = True
-        self._show_dialogue_node()
 
     def _procedural_talk(self, target: Entity) -> None:
-        """Fall back to procedural dialogue when no tree is registered."""
         identity = self.engine.world.get_component(target, Identity)
         name = identity.display_name if identity else "stranger"
         from engine.procedural_dialogue.system import NPCContext
         ctx = NPCContext(npc_name=name, npc_occupation="commoner",
                          npc_mood="neutral", relationship_to_player=0.0)
         line = self.proc_dialogue.generate_greeting(ctx)
-        self.print_header(f"Conversation with {name}", Color.GOLD)
-        self.print(f"  {name}: {line.text}", Color.YELLOW)
-        self.print("  [1] Ask about rumours", Color.WHITE)
-        self.print("  [2] Ask about the weather", Color.WHITE)
-        self.print("  [3] Ask about trade", Color.WHITE)
-        self.print("  [0] End conversation", Color.GRAY)
-        self.print_separator()
-        # We re-use the dialogue machinery with a synthetic tree-less state.
+        body = Text()
+        body.append(f"{name}: {line.text}\n\n", style="yellow")
+        body.append("[1] Ask about rumours\n", style="white")
+        body.append("[2] Ask about the weather\n", style="white")
+        body.append("[3] Ask about trade\n", style="white")
+        body.append("[0] End conversation", style="dim")
+        self.set_output(body, title=f"Conversation with {name}")
         self._in_dialogue = True
-        self._dialogue_tree = None  # mark procedural
+        self._dialogue_tree = None
         self._dialogue_ctx = (target, ctx)
-
-    def _show_dialogue_node(self) -> None:
-        if self._dialogue_tree is None or self._dialogue_ctx is None:
-            self._in_dialogue = False
-            return
-        node = self._dialogue_tree.get(self._dialogue_ctx.current_node_id)
-        if node is None:
-            self._in_dialogue = False
-            return
-        identity = self.engine.world.get_component(self._dialogue_ctx.npc, Identity)
-        npc_name = identity.display_name if identity else "NPC"
-        self.print_header(f"Conversation with {npc_name}", Color.GOLD)
-        self.print(f"  {npc_name}: {node.speaker_text}", Color.YELLOW)
-        if node.choices:
-            self.print()
-            self.print("  Choices:", Color.GRAY)
-            for i, choice in enumerate(node.choices):
-                self.print(f"    [{i + 1}] {choice.text}", Color.WHITE)
-            self.print(f"    [0] End conversation", Color.GRAY)
-        else:
-            self._in_dialogue = False
-        self.print_separator()
 
     def _handle_dialogue_input(self, line: str) -> bool:
         if not self._in_dialogue:
@@ -1179,35 +1197,39 @@ class GameREPL:
             self._in_dialogue = False
             self._dialogue_tree = None
             self._dialogue_ctx = None
-            self.print("You end the conversation.", Color.GRAY)
+            self.msg("You end the conversation.", Color.GRAY)
             return True
-        # Procedural dialogue path.
         if self._dialogue_tree is None and isinstance(self._dialogue_ctx, tuple):
             target, ctx = self._dialogue_ctx
             identity = self.engine.world.get_component(target, Identity)
             npc_name = identity.display_name if identity else "NPC"
             topic = {"1": "rumours", "2": "weather", "3": "trade"}.get(line)
             if topic is None:
-                self.print("Invalid choice.", Color.RED)
+                self.set_output(Text("Invalid choice.", style="red"),
+                                title="Conversation")
                 return True
             line_obj = self.proc_dialogue.generate_topic_line(topic, ctx)
-            self.print(f"  {npc_name}: {line_obj.text}", Color.YELLOW)
-            self.print("  [1] Ask about rumours", Color.WHITE)
-            self.print("  [2] Ask about the weather", Color.WHITE)
-            self.print("  [3] Ask about trade", Color.WHITE)
-            self.print("  [0] End conversation", Color.GRAY)
+            body = Text()
+            body.append(f"{npc_name}: {line_obj.text}\n\n", style="yellow")
+            body.append("[1] Ask about rumours\n", style="white")
+            body.append("[2] Ask about the weather\n", style="white")
+            body.append("[3] Ask about trade\n", style="white")
+            body.append("[0] End conversation", style="dim")
+            self.set_output(body, title=f"Conversation with {npc_name}")
             return True
         try:
             choice_idx = int(line) - 1
         except ValueError:
-            self.print("Invalid choice. Enter a number.", Color.RED)
+            self.set_output(Text("Invalid choice. Enter a number.", style="red"),
+                            title="Conversation")
             return True
         if self._dialogue_tree is None or self._dialogue_ctx is None:
             self._in_dialogue = False
             return True
         node = self._dialogue_tree.get(self._dialogue_ctx.current_node_id)
         if node is None or choice_idx < 0 or choice_idx >= len(node.choices):
-            self.print("Invalid choice.", Color.RED)
+            self.set_output(Text("Invalid choice.", style="red"),
+                            title="Conversation")
             return True
         choice = node.choices[choice_idx]
         for effect in choice.effects:
@@ -1220,7 +1242,7 @@ class GameREPL:
             self._in_dialogue = False
             self._dialogue_tree = None
             self._dialogue_ctx = None
-            self.print("You end the conversation.", Color.GRAY)
+            self.msg("You end the conversation.", Color.GRAY)
             return True
         next_node = self._dialogue_tree.get(next_id)
         if next_node is None:
@@ -1229,7 +1251,6 @@ class GameREPL:
         self._dialogue_ctx.current_node_id = next_id
         self._dialogue_ctx.visited_nodes.add(next_id)
         self._dialogue_ctx.history.append(next_node.speaker_text)
-        self._show_dialogue_node()
         return True
 
     # ----- time, rest, sleep ---------------------------------------------- #
@@ -1240,11 +1261,12 @@ class GameREPL:
             try:
                 minutes = int(args[0])
             except ValueError:
-                self.print("Usage: wait [minutes]", Color.GRAY)
+                self.set_output(Text("Usage: wait [minutes]", style="dim"),
+                                title="Wait")
                 return
         ticks = minutes * self.engine.clock.ticks_per_game_minute
         self.engine.clock.advance_ticks(ticks)
-        self.engine.message_log.add(f"You wait for {minutes} minutes.", Color.GRAY)
+        self.msg(f"You wait for {minutes} minutes.", Color.GRAY)
 
     def cmd_rest(self, args: list[str]) -> None:
         from engine.entities.components import Needs as NeedsComp
@@ -1257,7 +1279,7 @@ class GameREPL:
             needs.fatigue = max(0, needs.fatigue - 20)
             needs.sleep = max(0, needs.sleep - 20)
         self.engine.clock.advance_ticks(60 * self.engine.clock.ticks_per_game_minute)
-        self.engine.message_log.add("You rest for an hour.", Color.GREEN)
+        self.msg("You rest for an hour.", Color.GREEN)
 
     def cmd_sleep(self, args: list[str]) -> None:
         from engine.entities.components import Needs as NeedsComp
@@ -1276,328 +1298,322 @@ class GameREPL:
         if needs:
             needs.fatigue = 0
             needs.sleep = 0
-        self.engine.message_log.add(
-            f"You sleep for {hours_to_sleep} hours. HP and fatigue restored.",
-            Color.GREEN,
-        )
+        self.msg(f"You sleep for {hours_to_sleep} hours. HP and fatigue restored.",
+                 Color.GREEN)
 
     # ----- help & status --------------------------------------------------- #
 
     def cmd_help(self, args: list[str]) -> None:
-        self.print_header("Aeon Engine — Help", Color.GOLD)
+        table = Table(title="Aeon Engine — Commands", border_style="gold1",
+                      show_lines=False, title_style="bold gold1")
+        table.add_column("Category", style="bold cyan", no_wrap=True)
+        table.add_column("Commands", style="white")
         categories = [
-            ("Movement", [
-                "h j k l (vi-keys) or wasd or arrows",
-                "y u b n for diagonals",
-                "go <direction>   move in a direction",
-                ".                wait one tick",
-            ]),
-            ("Actions", [
-                "look [target]    look around or at a target (l)",
-                "attack <target>  attack an entity (a)",
-                "cast <spell>     cast a spell",
-                "use <item>       use an item (eat/drink)",
-                "equip <item>     equip a weapon or armor",
-                "unequip <slot>   unequip (weapon/chest)",
-                "drop <item>      drop an item",
-                "pickup           pick up items on the ground",
-                "talk [npc]       talk to an NPC (t)",
-                "trade [npc]      trade with a merchant",
-            ]),
-            ("Character", [
-                "inventory        show inventory (i)",
-                "character        show character sheet (c)",
-                "status           show status panel (st)",
-                "spells           list known spells (sp)",
-                "skills           list skills (sk)",
-                "schools          list magic schools",
-            ]),
-            ("Magic", [
-                "cast <spell>     cast a spell",
-                "research <name> <school>   start a research project",
-                "meditate [hours] advance research",
-            ]),
-            ("Crafting & Skills", [
-                "craft <recipe>   craft an item",
-                "recipes          list recipes",
-                "train <skill> [hours]  train a skill",
-                "use_skill <skill> [difficulty]  attempt a skill check",
-                "read <book_id>   read a skill book",
-                "books            list available books",
-                "inscribe <rune> on <item>  inscribe a rune",
-                "runes            list runes",
-            ]),
-            ("Economy", [
-                "market           show market prices",
-                "buy <good> [qty] buy a trade good",
-                "sell <good> [qty] sell a trade good",
-                "bank <deposit|withdraw|balance> [amount]",
-                "loan <take|repay> <amount> [months]",
-                "caravan <route> <good> <qty>  dispatch caravan",
-                "ship <route> <good> <qty>     dispatch trade ship",
-                "trade_routes     list trade routes",
-            ]),
-            ("Auctions & Black Market", [
-                "auction list     list active auctions",
-                "auction sell <item> <price>  schedule auction",
-                "bid <id> <amount> place a bid",
-                "blackmarket list  list black market goods",
-                "blackmarket buy <listing>",
-                "fence <item>     fence a stolen item",
-                "hire_assassin <target>  hire an assassin",
-            ]),
-            ("Quests & Factions", [
-                "quests           show quest log",
-                "quest list       list available quests",
-                "quest accept <id>  accept a quest",
-                "quest advance <id> <stage> <obj> [n]",
-                "quest complete <id>",
-                "quest abandon <id>",
-                "factions         list factions",
-                "faction <id>     show faction info",
-            ]),
-            ("Kingdoms & Politics", [
-                "kingdoms         list kingdoms",
-                "kingdom <id>     show kingdom info",
-                "war <a> <b>      declare war",
-                "peace <a> <b>    make peace",
-                "alliance <a> <b> form alliance",
-                "annex <kingdom> <territory>",
-                "election <kingdom>",
-            ]),
-            ("Espionage & Rebellion", [
-                "recruit_spy <entity_id> <name>",
-                "mission <spy_id> <type> <target>",
-                "resolve_mission <id>",
-                "spies            list your spies",
-                "rebellion <type> <faction>  start rebellion",
-                "suppress <id>    suppress a rebellion",
-                "negotiate <id>   negotiate settlement",
-            ]),
-            ("Combat Variants", [
-                "naval <bombard|board> <ship_id>",
-                "siege <create|bombard|assault> ...",
-                "aerial <mount|dive|attack> ...",
-                "space <fire|launch> ...",
-                "realtime <queue|cancel> ...",
-                "mount <mount|dismount|charge> ...",
-            ]),
-            ("Survival & Life", [
-                "rest             rest for an hour",
-                "sleep            sleep until morning",
-                "wait [minutes]   wait (. for default)",
-                "diseases         list known diseases",
-                "cure <disease>   attempt to cure",
-                "marry <partner>  marry an NPC",
-                "divorce <partner>",
-                "family           show family info",
-                "job              find a job",
-            ]),
-            ("Dungeons & Exploration", [
-                "dungeon <type> [depth]  generate a dungeon",
-                "enter_dungeon <id>",
-                "bookmark add <name>",
-                "bookmark list",
-                "pin <x> <y> [label]",
-            ]),
-            ("Animals & Hunting", [
-                "hunt <species>   hunt an animal",
-                "tame <species>   attempt to tame",
-                "livestock        list livestock",
-                "animals          list species",
-            ]),
-            ("Artifacts", [
-                "artifacts        list known artifacts",
-                "wield <artifact>",
-                "power <artifact> <power>",
-                "talk_artifact <artifact>",
-                "destroy <artifact> <method>",
-            ]),
-            ("Reputation", [
-                "reputation       show your reputation",
-                "hero <deed>      perform a heroic deed",
-                "crime <type>     commit a crime",
-            ]),
-            ("Stealth", [
-                "stealth on       enter stealth",
-                "stealth off      exit stealth",
-                "backstab <target>",
-            ]),
-            ("World & Time", [
-                "map              show world map (m)",
-                "time             show game time",
-                "weather          show weather",
-                "simulate [hours] simulate background time",
-            ]),
-            ("Themes & Dimensions", [
-                "theme list       list themes",
-                "theme set <name> switch theme",
-                "dimensions       list dimensions",
-                "portal <from> <to>  open portal",
-                "travel <dim>     travel to dimension",
-            ]),
-            ("Body Parts", [
-                "bodyparts        show body part status",
-                "heal_part <part> [amount]",
-            ]),
-            ("System", [
-                "save [name]      save the game",
-                "load <name>      load a save",
-                "plugins          list plugins",
-                "contentpacks     list content packs",
-                "help             this message (?)",
-                "Quit             exit the game (q)",
-            ]),
+            ("Movement", "h j k l (vi-keys) or wasd or arrows; y u b n diagonals; "
+                         "go <dir>; . wait"),
+            ("Actions", "look [target] (l); attack <t> (a); cast <spell>; use <item>; "
+                        "equip <item>; unequip <slot>; drop <item>; pickup; talk [npc] (t); "
+                        "trade [npc]"),
+            ("Character", "inventory (i); character (c); status (st); spells (sp); "
+                          "skills (sk); schools"),
+            ("Magic", "cast <spell>; research <name> <school>; meditate [hours]"),
+            ("Crafting", "craft <recipe>; recipes; train <skill> [hours]; "
+                         "use_skill <skill> [diff]; read <book>; books; "
+                         "inscribe <rune> on <item>; runes"),
+            ("Economy", "market; buy <good> [qty]; sell <good> [qty]; "
+                        "bank <deposit|withdraw|balance> [amt]; loan <take> <amt> [months]; "
+                        "caravan <route> <good> <qty>; ship <route> <good> <qty>; trade_routes"),
+            ("Auctions", "auction list; auction sell <item> <price>; bid <id> <amt>; "
+                         "blackmarket list; blackmarket buy <id>; fence <item>; hire_assassin <id>"),
+            ("Quests", "quests; quest list; quest accept <id>; quest advance <q> <s> <o>; "
+                       "quest complete <id>; quest abandon <id>"),
+            ("Factions", "factions; faction <id>; kingdoms; kingdom <id>; war <a> <b>; "
+                         "peace <a> <b>; alliance <a> <b>; annex <k> <t>; election <k>"),
+            ("Espionage", "recruit_spy <id> <name>; mission <spy> <type> <target>; "
+                          "resolve_mission <id>; spies"),
+            ("Rebellion", "rebellion <type> <faction>; suppress <id>; negotiate <id>"),
+            ("Combat Var.", "naval <bombard|board> <id>; siege <create|bombard|assault> ...; "
+                            "aerial <mount|dive|attack>; space <fire|launch>; "
+                            "realtime <queue|cancel>; mount <mount|dismount|charge>"),
+            ("Survival", "rest; sleep; wait [min]; diseases; cure <disease>; "
+                         "marry <partner>; divorce; family; job"),
+            ("Dungeons", "dungeon <type> [depth]; bookmark <add|list|remove>; pin <x> <y> [label]"),
+            ("Animals", "hunt <species>; tame <species>; livestock; animals"),
+            ("Artifacts", "artifacts; wield <id>; power <id> <name>; "
+                          "talk_artifact <id>; destroy <id> <method>"),
+            ("Reputation", "reputation; hero <deed>; crime <type>"),
+            ("Stealth", "stealth <on|off>; backstab [target]"),
+            ("World", "map (m); time; weather; simulate [hours]; contentpacks"),
+            ("Themes", "theme list; theme set <name>"),
+            ("Dimensions", "dimensions; portal <from> <to>; travel <dim>"),
+            ("Body Parts", "bodyparts; heal_part <part> [amount]"),
+            ("System", "save [name]; load <name>; plugins; help (?); banner; Quit (q)"),
         ]
         for cat, lines in categories:
-            self.print(f"  {cat}:", Color.CYAN)
-            for ln in lines:
-                self.print(f"    {ln}", Color.WHITE)
-            self.print()
-        self.print_separator()
+            table.add_row(cat, lines)
+        self.set_output(table, title="Help")
+
+    def cmd_banner(self, args: list[str]) -> None:
+        """Show the welcome banner as a persistent panel."""
+        self.set_output(self._banner_panel().renderable, title="Aeon Engine")
 
     def cmd_status(self, args: list[str]) -> None:
-        self.show_status_panel()
+        # Status is always visible in the top panel, but we also surface it
+        # as a command output panel so legacy tests can introspect it.
+        if self.engine.player is None:
+            return
+        player = self.engine.player
+        world = self.engine.world
+        identity = world.get_component(player, Identity)
+        health = world.get_component(player, Health)
+        name = identity.display_name if identity else "Hero"
+        body = Text()
+        body.append(f"Name: {name}\n", style="bold gold1")
+        if health:
+            body.append(f"HP: {health.current}/{health.maximum}\n", style="red")
+        self.set_output(body, title="Status")
 
     def cmd_inventory(self, args: list[str]) -> None:
-        self.show_inventory()
+        if self.engine.player is None:
+            return
+        inv = self.engine.inventories.get(self.engine.player.id)
+        if inv is None:
+            self.set_output(Text("You have no inventory.", style="dim"),
+                            title="Inventory")
+            return
+        body = Text()
+        body.append("Equipment:\n", style="bold yellow")
+        for slot, item_id in inv.all_equipped().items():
+            if item_id is None:
+                body.append(f"  {slot.value:15s} (empty)\n", style="dim")
+            else:
+                item = self.engine.items.get(item_id)
+                if item:
+                    body.append(f"  {slot.value:15s} {item.display_name}\n", style="white")
+        body.append("\nBackpack:\n", style="bold yellow")
+        any_items = False
+        for slot_idx, item, count in inv.iter_items(self.engine.items):
+            any_items = True
+            line = f"  [{slot_idx:2d}] {item.display_name}"
+            if count > 1:
+                line += f" x{count}"
+            line += f"  ({item.weight:.1f}kg, {item.total_value}cp)\n"
+            body.append(line, style="white")
+        if not any_items:
+            body.append("  (empty)\n", style="dim")
+        weight = inv.total_weight(self.engine.items)
+        body.append(f"\nTotal weight: {weight:.1f}/{inv.max_weight:.1f} kg\n",
+                    style="dim")
+        self.set_output(body, title="Inventory")
 
     def cmd_character(self, args: list[str]) -> None:
-        self.show_character_sheet()
+        if self.engine.player is None:
+            return
+        player = self.engine.player
+        identity = self.engine.world.get_component(player, Identity)
+        health = self.engine.world.get_component(player, Health)
+        stats = self.engine.world.get_component(player, Stats)
+        race = self.engine.world.get_component(player, Race)
+        wealth = self.engine.world.get_component(player, Wealth)
+        body = Text()
+        if identity:
+            body.append(f"Name: {identity.display_name}\n", style="bold gold1")
+            if identity.description:
+                body.append(f"Description: {identity.description}\n", style="dim")
+        if race:
+            body.append(f"Race: {race.race_id.title()}  Age: {race.age}\n", style="white")
+        if health:
+            body.append(f"HP: {health.current}/{health.maximum}\n", style="red")
+        if wealth:
+            body.append(f"Wealth: {_format_money(wealth.total_copper())}\n",
+                        style="gold1")
+        if stats:
+            body.append("\nAttributes:\n", style="bold yellow")
+            for attr in ("strength", "agility", "endurance", "intelligence",
+                         "willpower", "charisma", "perception", "luck"):
+                val = getattr(stats, attr)
+                body.append(f"  {attr:14s}: {val}\n", style="white")
+            body.append("\nDerived:\n", style="bold yellow")
+            derived = stats.derived()
+            for k, v in derived.items():
+                body.append(f"  {k:18s}: {v}\n", style="white")
+        self.set_output(body, title="Character")
 
     def cmd_map(self, args: list[str]) -> None:
-        self.show_map_view(radius=20)
+        # The map is already always visible; just clear command output.
+        self.clear_output()
 
     def cmd_spells(self, args: list[str]) -> None:
-        self.show_spells()
+        from engine.magic.spells import SpellLibrary
+        mana = (self.engine.world.get_component(self.engine.player, Mana)
+                if self.engine.player else None)
+        table = Table(title="Spells", border_style="blue")
+        table.add_column("Name", style="blue")
+        table.add_column("Mana", style="cyan", justify="right")
+        table.add_column("Target", style="dim")
+        if mana:
+            table.caption = f"MP: {mana.current:.0f}/{mana.maximum:.0f}"
+        for spell in SpellLibrary.all():
+            target_str = spell.target.value if spell.target.value != "self" else "—"
+            table.add_row(spell.name, str(spell.mana_cost), target_str)
+        self.set_output(table, title="Spells")
 
     def cmd_skills(self, args: list[str]) -> None:
-        self.show_skills()
+        from engine.entities.components import Skills as SkillsComp
+        from engine.skills.system import SkillLibrary
+        comp = (self.engine.world.get_component(self.engine.player, SkillsComp)
+                if self.engine.player else None)
+        table = Table(title="Skills", border_style="cyan")
+        table.add_column("Skill", style="cyan")
+        table.add_column("Level", style="white", justify="right")
+        table.add_column("XP", style="dim", justify="right")
+        if comp is None or not comp.skills:
+            table.add_row("(no skills yet — try: train <skill>)", "", "")
+        else:
+            for skill_id, sl in sorted(comp.skills.items(),
+                                        key=lambda x: -x[1].level):
+                skill = SkillLibrary.get(skill_id)
+                name = skill.name if skill else skill_id
+                table.add_row(name, str(sl.level), f"{sl.xp:.0f}")
+        self.set_output(table, title="Skills")
 
     def cmd_quests(self, args: list[str]) -> None:
         if self.engine.player is None:
             return
         tracker = self.engine.quest_trackers.get(self.engine.player.id)
         if tracker is None:
-            self.print("You have no quest log.", Color.GRAY)
+            self.set_output(Text("You have no quest log.", style="dim"),
+                            title="Quests")
             return
-        self.print_header("Quest Log", Color.GOLD)
+        body = Text()
         if tracker.active:
-            self.print("Active Quests:", Color.YELLOW)
+            body.append("Active Quests:\n", style="bold yellow")
             from engine.quests.system import QuestLibrary
             for quest_id, stage_id in tracker.active.items():
                 quest = QuestLibrary.get(quest_id)
                 if quest:
-                    self.print(f"  {quest.name} (stage: {stage_id})",
-                               color=Color.WHITE)
-                    self.print(f"    {quest.description}", Color.GRAY)
+                    body.append(f"  {quest.name} (stage: {stage_id})\n", style="white")
+                    body.append(f"    {quest.description}\n", style="dim")
         else:
-            self.print("  No active quests.", Color.GRAY)
+            body.append("No active quests.\n", style="dim")
         if tracker.completed:
-            self.print()
-            self.print(f"Completed: {len(tracker.completed)}", Color.GREEN)
+            body.append(f"\nCompleted: {len(tracker.completed)}\n", style="green")
         if tracker.failed:
-            self.print(f"Failed: {len(tracker.failed)}", Color.RED)
-        self.print_separator()
+            body.append(f"Failed: {len(tracker.failed)}\n", style="red")
+        self.set_output(body, title="Quest Log")
 
     def cmd_quest(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: quest <list|accept|advance|complete|abandon> ...",
-                       color=Color.GRAY)
+            self.set_output(Text(
+                "Usage: quest <list|accept|advance|complete|abandon> ...",
+                style="dim"), title="Quest")
             return
         sub = args[0].lower()
-        from engine.quests.system import QuestLibrary
+        from engine.quests.system import QuestLibrary, QuestTracker
         tracker = self.engine.quest_trackers.get(self.engine.player.id)
         if tracker is None:
             tracker = self.engine.quest_trackers.setdefault(
-                self.engine.player.id, type(tracker)() if tracker else
-                __import__("engine.quests.system", fromlist=["QuestTracker"]).QuestTracker())
+                self.engine.player.id, QuestTracker())
         if sub == "list":
-            self.print_header("Available Quests", Color.GOLD)
+            table = Table(title="Available Quests", border_style="gold1")
+            table.add_column("ID", style="cyan", justify="right")
+            table.add_column("Name", style="white")
+            table.add_column("Description", style="dim")
             for q in QuestLibrary.all():
-                self.print(f"  #{q.id}  {q.name}", Color.WHITE)
-                self.print(f"    {q.description}", Color.GRAY)
-            self.print_separator()
+                table.add_row(str(q.id), q.name, q.description)
+            self.set_output(table, title="Available Quests")
         elif sub == "accept":
             if len(args) < 2:
-                self.print("Usage: quest accept <quest_id>", Color.GRAY)
+                self.set_output(Text("Usage: quest accept <quest_id>", style="dim"),
+                                title="Quest")
                 return
-            q = QuestLibrary.get(args[1])
+            try:
+                qid = int(args[1])
+            except ValueError:
+                qid = args[1]
+            q = QuestLibrary.get(qid)
             if q is None:
-                self.print(f"Unknown quest: {args[1]}", Color.RED)
+                self.set_output(Text(f"Unknown quest: {args[1]}", style="red"),
+                                title="Quest")
                 return
             tracker.start(q, self.engine.clock.time.tick)
             self.msg(f"Quest accepted: {q.name}", Color.GREEN)
         elif sub == "advance":
             if len(args) < 4:
-                self.print("Usage: quest advance <quest_id> <stage> <obj> [n]",
-                           color=Color.GRAY)
+                self.set_output(Text(
+                    "Usage: quest advance <quest_id> <stage> <obj> [n]",
+                    style="dim"), title="Quest")
                 return
             amount = int(args[4]) if len(args) > 4 and args[4].isdigit() else 1
             tracker.advance_objective(args[1], args[2], args[3], amount)
             self.msg(f"Objective advanced: {args[3]} (+{amount})", Color.GREEN)
         elif sub == "complete":
             if len(args) < 2:
-                self.print("Usage: quest complete <quest_id>", Color.GRAY)
+                self.set_output(Text("Usage: quest complete <quest_id>", style="dim"),
+                                title="Quest")
                 return
             tracker.complete_quest(args[1])
             self.msg(f"Quest completed: {args[1]}", Color.GREEN)
         elif sub == "abandon":
             if len(args) < 2:
-                self.print("Usage: quest abandon <quest_id>", Color.GRAY)
+                self.set_output(Text("Usage: quest abandon <quest_id>", style="dim"),
+                                title="Quest")
                 return
             tracker.abandon_quest(args[1])
             self.msg(f"Quest abandoned: {args[1]}", Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Quest")
 
     def cmd_time(self, args: list[str]) -> None:
         time_str = self.engine.clock.time.display()
         phase = self.engine.clock.time.phase_of_day().display_name
         season = self.engine.clock.time.season_name()
-        self.print_header("Time", Color.GOLD)
-        self.print(f"  {time_str}", Color.CYAN)
-        self.print(f"  Phase: {phase}", Color.GRAY)
-        self.print(f"  Season: {season}", Color.GRAY)
-        self.print(f"  Tick: {self.engine.clock.time.tick}", Color.GRAY)
-        self.print_separator()
+        body = Text()
+        body.append(f"{time_str}\n", style="cyan")
+        body.append(f"Phase: {phase}\n", style="dim")
+        body.append(f"Season: {season}\n", style="dim")
+        body.append(f"Tick: {self.engine.clock.time.tick}\n", style="dim")
+        self.set_output(body, title="Time")
 
     def cmd_weather(self, args: list[str]) -> None:
         if self.engine.weather is None:
             return
-        self.print_header("Weather", Color.GOLD)
-        self.print(f"  {self.engine.weather.current.description()}", Color.CYAN)
-        self.print_separator()
+        body = Text(self.engine.weather.current.description(), style="cyan")
+        self.set_output(body, title="Weather")
 
     def cmd_plugins(self, args: list[str]) -> None:
-        self.print_header("Plugins", Color.GOLD)
+        table = Table(title="Plugins", border_style="magenta")
+        table.add_column("Name", style="white")
+        table.add_column("Version", style="cyan")
+        table.add_column("State", style="dim")
         try:
             for s in self.engine.plugins.status():
-                self.print(f"  {s['name']:25s} v{s['version']:8s} [{s['state']}]",
-                           color=Color.WHITE)
+                table.add_row(s["name"], s["version"], s["state"])
         except Exception as exc:  # noqa: BLE001
-            self.print(f"  Error listing plugins: {exc}", Color.RED)
-        self.print_separator()
+            table.add_row(f"Error: {exc}", "", "")
+        self.set_output(table, title="Plugins")
 
     def cmd_save(self, args: list[str]) -> None:
         name = args[0] if args else "quicksave"
         try:
             self.engine.save_game(name)
-            self.engine.message_log.add(f"Game saved as '{name}'.", Color.GREEN)
+            self.msg(f"Game saved as '{name}'.", Color.GREEN)
         except Exception as exc:  # noqa: BLE001
-            self.engine.message_log.add(f"Save failed: {exc}", Color.RED)
+            self.msg(f"Save failed: {exc}", Color.RED)
 
     def cmd_load(self, args: list[str]) -> None:
         if not args:
-            self.print("Load what? Try: load my_save", Color.GRAY)
+            self.set_output(Text("Load what? Try: load my_save", style="dim"),
+                            title="Load")
             return
         try:
             self.engine.load_game(args[0])
-            self.engine.message_log.add(f"Loaded save '{args[0]}'.", Color.GREEN)
+            self.msg(f"Loaded save '{args[0]}'.", Color.GREEN)
         except FileNotFoundError:
-            self.engine.message_log.add(f"Save '{args[0]}' not found.", Color.RED)
+            self.msg(f"Save '{args[0]}' not found.", Color.RED)
         except Exception as exc:  # noqa: BLE001
-            self.engine.message_log.add(f"Load failed: {exc}", Color.RED)
+            self.msg(f"Load failed: {exc}", Color.RED)
 
     def cmd_quit(self, args: list[str]) -> None:
         self.running = False
@@ -1615,17 +1631,13 @@ class GameREPL:
                 water_adjacent = True
                 break
         if not water_adjacent:
-            self.engine.message_log.add("You need to be near water to fish.",
-                                         Color.GRAY)
+            self.msg("You need to be near water to fish.", Color.GRAY)
             return
         if self.engine.rng.chance(0.5):
             from engine.items.generator import ItemGenerationParams
             fish_types = ["fish", "salmon", "trout"]
             fish_name = self.engine.rng.choice(fish_types)
-            params = ItemGenerationParams(
-                archetype="bread",
-                material_id="organic",
-            )
+            params = ItemGenerationParams(archetype="bread", material_id="organic")
             item = self.engine.item_generator.generate(params, self.engine.items.next_id())
             item.name = fish_name.title()
             item.description = f"A fresh-caught {fish_name}."
@@ -1635,27 +1647,27 @@ class GameREPL:
             inv = self.engine.inventories.get(self.engine.player.id)
             if inv:
                 inv.add(item)
-            self.engine.message_log.add(f"You caught a {fish_name}!", Color.GREEN)
+            self.msg(f"You caught a {fish_name}!", Color.GREEN)
         else:
-            self.engine.message_log.add("You wait, but nothing bites...", Color.GRAY)
+            self.msg("You wait, but nothing bites...", Color.GRAY)
 
     # ----- crafting & skills ---------------------------------------------- #
 
     def cmd_craft(self, args: list[str]) -> None:
         if not args:
-            self.print("Craft what? Try: craft iron_dagger", Color.GRAY)
             self.cmd_recipes([])
             return
         from engine.crafting.system import RecipeLibrary
         recipe = RecipeLibrary.get(args[0])
         if recipe is None:
-            self.print(f"Unknown recipe: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown recipe: {args[0]}", style="red"),
+                            title="Craft")
             return
         inv = self.engine.inventories.get(self.engine.player.id)
         if inv is None:
-            self.print("You have no inventory.", Color.RED)
+            self.set_output(Text("You have no inventory.", style="red"),
+                            title="Craft")
             return
-        # Gather available materials from inventory.
         materials: dict[str, int] = {}
         for _, item, count in inv.iter_items(self.engine.items):
             for tag in item.tags:
@@ -1686,18 +1698,21 @@ class GameREPL:
 
     def cmd_recipes(self, args: list[str]) -> None:
         from engine.crafting.system import RecipeLibrary
-        self.print_header("Recipes", Color.GOLD)
+        table = Table(title="Recipes", border_style="yellow")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="white")
+        table.add_column("Skill", style="dim")
+        table.add_column("Lv", style="dim", justify="right")
+        table.add_column("Materials", style="white")
         for r in RecipeLibrary.all():
-            self.print(f"  {r.id:20s} {r.name}", Color.WHITE)
-            self.print(f"    skill: {r.skill_id} (level {r.skill_level_required})",
-                       color=Color.GRAY)
             mats = ", ".join(f"{n}x{k}" for k, n in r.materials.items())
-            self.print(f"    materials: {mats}", Color.GRAY)
-        self.print_separator()
+            table.add_row(r.id, r.name, r.skill_id, str(r.skill_level_required), mats)
+        self.set_output(table, title="Recipes")
 
     def cmd_train(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: train <skill> [hours]", Color.GRAY)
+            self.set_output(Text("Usage: train <skill> [hours]", style="dim"),
+                            title="Train")
             return
         skill_id = args[0]
         hours = float(args[1]) if len(args) > 1 else 1.0
@@ -1709,7 +1724,8 @@ class GameREPL:
 
     def cmd_use_skill(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: use_skill <skill> [difficulty]", Color.GRAY)
+            self.set_output(Text("Usage: use_skill <skill> [difficulty]",
+                                 style="dim"), title="Use Skill")
             return
         skill_id = args[0]
         difficulty = float(args[1]) if len(args) > 1 else 10.0
@@ -1725,36 +1741,41 @@ class GameREPL:
 
     def cmd_read(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: read <book_id>", Color.GRAY)
+            self.set_output(Text("Usage: read <book_id>", style="dim"),
+                            title="Read")
             return
         from engine.skill_books.system import SkillBookLibrary
         book = SkillBookLibrary.get(args[0])
         if book is None:
-            self.print(f"Unknown book: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown book: {args[0]}", style="red"),
+                            title="Read")
             return
         ok, msg = self.skill_books.start_reading(self.engine.player, book)
         self.msg(msg, Color.GREEN if ok else Color.RED)
 
     def cmd_books(self, args: list[str]) -> None:
         from engine.skill_books.system import SkillBookLibrary
-        self.print_header("Skill Books", Color.GOLD)
+        table = Table(title="Skill Books", border_style="yellow")
+        table.add_column("ID", style="cyan")
+        table.add_column("Title", style="white")
+        table.add_column("Type", style="dim")
+        table.add_column("Skill", style="dim")
         for b in SkillBookLibrary.all():
-            self.print(f"  {b.book_id:25s} {b.title}", Color.WHITE)
-            self.print(f"    type: {b.book_type.value}  skill: {b.skill_id}",
-                       color=Color.GRAY)
-        self.print_separator()
+            table.add_row(b.book_id, b.title, b.book_type.value, b.skill_id)
+        self.set_output(table, title="Skill Books")
 
     def cmd_inscribe(self, args: list[str]) -> None:
-        """inscribe <rune_id> on <item_name>"""
         if len(args) < 3 or args[1] != "on":
-            self.print("Usage: inscribe <rune_id> on <item_name>", Color.GRAY)
+            self.set_output(Text("Usage: inscribe <rune_id> on <item_name>",
+                                 style="dim"), title="Inscribe")
             return
         rune_id = args[0]
         item_name = " ".join(args[2:]).lower()
         from engine.runes.system import RuneLibrary
         rune = RuneLibrary.get(rune_id)
         if rune is None:
-            self.print(f"Unknown rune: {rune_id}", Color.RED)
+            self.set_output(Text(f"Unknown rune: {rune_id}", style="red"),
+                            title="Inscribe")
             return
         inv = self.engine.inventories.get(self.engine.player.id)
         if inv is None:
@@ -1765,7 +1786,8 @@ class GameREPL:
                 target_item = item
                 break
         if target_item is None:
-            self.print(f"You don't have any '{item_name}'.", Color.RED)
+            self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                            title="Inscribe")
             return
         from engine.entities.components import Skills as SkillsComp
         comp = self.engine.world.get_component(self.engine.player, SkillsComp)
@@ -1779,19 +1801,21 @@ class GameREPL:
 
     def cmd_runes(self, args: list[str]) -> None:
         from engine.runes.system import RuneLibrary
-        self.print_header("Runes", Color.GOLD)
+        table = Table(title="Runes", border_style="red")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="white")
+        table.add_column("Type", style="dim")
+        table.add_column("Power", style="dim", justify="right")
         for r in RuneLibrary.all():
-            self.print(f"  {r.rune_id:20s} {r.name}", Color.WHITE)
-            self.print(f"    type: {r.rune_type.value}  power: {r.base_power}",
-                       color=Color.GRAY)
-        self.print_separator()
+            table.add_row(r.rune_id, r.name, r.rune_type.value, str(r.base_power))
+        self.set_output(table, title="Runes")
 
     # ----- economy: bank / loan ------------------------------------------- #
 
     def cmd_bank(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: bank <deposit|withdraw|balance> [amount]",
-                       color=Color.GRAY)
+            self.set_output(Text("Usage: bank <deposit|withdraw|balance> [amount]",
+                                 style="dim"), title="Bank")
             return
         sub = args[0].lower()
         if not self.engine.economy.banks:
@@ -1801,26 +1825,29 @@ class GameREPL:
         if sub == "balance":
             acct = bank.accounts.get(pid)
             if acct:
-                self.msg(f"Bank balance: {_format_money(acct.balance)}", Color.GOLD)
+                self.set_output(Text(f"Bank balance: {_format_money(acct.balance)}",
+                                     style="gold1"), title="Bank Balance")
             else:
-                self.msg("You have no bank account.", Color.GRAY)
+                self.set_output(Text("You have no bank account.", style="dim"),
+                                title="Bank Balance")
         elif sub == "deposit":
             if len(args) < 2 or not args[1].isdigit():
-                self.print("Usage: bank deposit <amount_copper>", Color.GRAY)
+                self.set_output(Text("Usage: bank deposit <amount_copper>",
+                                     style="dim"), title="Bank")
                 return
             amount = int(args[1])
             wealth = self.engine.world.get_component(self.engine.player, Wealth)
             if wealth is None or wealth.total_copper() < amount:
                 self.msg("You don't have that much money.", Color.RED)
                 return
-            # Deduct from wealth.
             bank.open_account(pid)
             bank.deposit(pid, amount)
             wealth.copper = max(0, wealth.copper - amount)
             self.msg(f"Deposited {_format_money(amount)}.", Color.GREEN)
         elif sub == "withdraw":
             if len(args) < 2 or not args[1].isdigit():
-                self.print("Usage: bank withdraw <amount_copper>", Color.GRAY)
+                self.set_output(Text("Usage: bank withdraw <amount_copper>",
+                                     style="dim"), title="Bank")
                 return
             amount = int(args[1])
             withdrawn = bank.withdraw(pid, amount)
@@ -1832,11 +1859,13 @@ class GameREPL:
             else:
                 self.msg("Insufficient bank balance.", Color.RED)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Bank")
 
     def cmd_loan(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: loan <take|repay> <amount> [months]", Color.GRAY)
+            self.set_output(Text("Usage: loan <take|repay> <amount> [months]",
+                                 style="dim"), title="Loan")
             return
         sub = args[0].lower()
         if not self.engine.economy.banks:
@@ -1845,7 +1874,8 @@ class GameREPL:
         pid = self.engine.player.id
         if sub == "take":
             if len(args) < 2 or not args[1].isdigit():
-                self.print("Usage: loan take <amount> [months]", Color.GRAY)
+                self.set_output(Text("Usage: loan take <amount> [months]",
+                                     style="dim"), title="Loan")
                 return
             amount = int(args[1])
             months = int(args[2]) if len(args) > 2 and args[2].isdigit() else 12
@@ -1860,12 +1890,13 @@ class GameREPL:
             else:
                 self.msg("Loan denied.", Color.RED)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Loan")
 
     def cmd_caravan(self, args: list[str]) -> None:
-        """caravan <route_id> <good> <qty>"""
         if len(args) < 3:
-            self.print("Usage: caravan <route_id> <good> <qty>", Color.GRAY)
+            self.set_output(Text("Usage: caravan <route_id> <good> <qty>",
+                                 style="dim"), title="Caravan")
             return
         route_id, good_id, qty = args[0], args[1], int(args[2])
         cargo = {good_id: qty}
@@ -1880,7 +1911,8 @@ class GameREPL:
 
     def cmd_ship(self, args: list[str]) -> None:
         if len(args) < 3:
-            self.print("Usage: ship <route_id> <good> <qty>", Color.GRAY)
+            self.set_output(Text("Usage: ship <route_id> <good> <qty>",
+                                 style="dim"), title="Ship")
             return
         route_id, good_id, qty = args[0], args[1], int(args[2])
         cargo = {good_id: qty}
@@ -1894,42 +1926,49 @@ class GameREPL:
             self.msg("Could not dispatch ship.", Color.RED)
 
     def cmd_trade_routes(self, args: list[str]) -> None:
-        self.print_header("Trade Routes", Color.GOLD)
-        for r in self.trade.routes():
-            self.print(f"  {r.route_id}  {r.name}  ({r.origin_market_id} → {r.destination_market_id})",
-                       color=Color.WHITE)
-        if not self.trade.routes():
-            self.print("  No trade routes established.", Color.GRAY)
-        self.print_separator()
+        table = Table(title="Trade Routes", border_style="cyan")
+        table.add_column("Route", style="cyan")
+        table.add_column("Name", style="white")
+        table.add_column("From → To", style="dim")
+        routes = list(self.trade.routes())
+        for r in routes:
+            table.add_row(r.route_id, r.name,
+                          f"{r.origin_market_id} → {r.destination_market_id}")
+        if not routes:
+            table.add_row("(none)", "", "")
+        self.set_output(table, title="Trade Routes")
 
     # ----- auctions & black market ---------------------------------------- #
 
     def cmd_auction(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: auction <list|sell> ...", Color.GRAY)
+            self.set_output(Text("Usage: auction <list|sell> ...", style="dim"),
+                            title="Auction")
             return
         sub = args[0].lower()
         if sub == "list":
-            self.print_header("Auctions", Color.GOLD)
+            table = Table(title="Auctions", border_style="magenta")
+            table.add_column("ID", style="cyan", justify="right")
+            table.add_column("Title", style="white")
+            table.add_column("Price", style="gold1", justify="right")
+            table.add_column("State", style="dim")
             auctions = list(self.auctions.all())
             for a in auctions:
-                self.print(f"  #{a.auction_id} {a.title}  price: {a.current_price}cp  [{a.state.name}]",
-                           color=Color.WHITE)
-                if a.description:
-                    self.print(f"    {a.description}", Color.GRAY)
+                table.add_row(str(a.auction_id), a.title,
+                              f"{a.current_price}cp", a.state.name)
             if not auctions:
-                self.print("  No auctions. Use 'auction sell <item> <price>' to start one.",
-                           color=Color.GRAY)
-            self.print_separator()
+                table.add_row("—", "(none — use 'auction sell <item> <price>')", "", "")
+            self.set_output(table, title="Auctions")
         elif sub == "sell":
             if len(args) < 3:
-                self.print("Usage: auction sell <item_name> <starting_price>",
-                           color=Color.GRAY)
+                self.set_output(Text("Usage: auction sell <item_name> <starting_price>",
+                                     style="dim"), title="Auction")
                 return
             try:
                 price = int(args[-1])
             except ValueError:
-                self.print(f"Invalid price: {args[-1]}", Color.RED)
+                self.set_output(Text(f"Invalid price: {args[-1]}", style="red"),
+                                title="Auction")
                 return
             item_name = " ".join(args[1:-1]).lower()
             inv = self.engine.inventories.get(self.engine.player.id)
@@ -1939,7 +1978,8 @@ class GameREPL:
                     target = item
                     break
             if target is None:
-                self.print(f"You don't have any '{item_name}'.", Color.RED)
+                self.set_output(Text(f"You don't have any '{item_name}'.",
+                                     style="red"), title="Auction")
                 return
             a = self.auctions.schedule_auction(
                 title=target.display_name, description="",
@@ -1950,11 +1990,13 @@ class GameREPL:
             self.msg(f"Auction #{a.auction_id} scheduled for {target.display_name}.",
                      Color.GREEN)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Auction")
 
     def cmd_bid(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: bid <auction_id> <amount>", Color.GRAY)
+            self.set_output(Text("Usage: bid <auction_id> <amount>", style="dim"),
+                            title="Bid")
             return
         ok, msg = self.auctions.place_bid(
             int(args[0]), self.engine.player.id, int(args[1]),
@@ -1964,7 +2006,8 @@ class GameREPL:
 
     def cmd_blackmarket(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: blackmarket <list|buy> ...", Color.GRAY)
+            self.set_output(Text("Usage: blackmarket <list|buy> ...", style="dim"),
+                            title="Black Market")
             return
         sub = args[0].lower()
         markets = self.blackmarket.markets()
@@ -1974,16 +2017,19 @@ class GameREPL:
         market = markets[0]
         market_id = market.market_id
         if sub == "list":
-            self.print_header("Black Market", Color.GOLD)
+            table = Table(title="Black Market", border_style="red")
+            table.add_column("ID", style="cyan", justify="right")
+            table.add_column("Item", style="white")
+            table.add_column("Price", style="gold1", justify="right")
             for lst in market.listings:
-                self.print(f"  #{lst.listing_id} {lst.item_name}  {lst.price}cp",
-                           color=Color.RED)
+                table.add_row(str(lst.listing_id), lst.item_name, f"{lst.price}cp")
             if not market.listings:
-                self.print("  Nothing for sale.", Color.GRAY)
-            self.print_separator()
+                table.add_row("—", "(nothing for sale)", "")
+            self.set_output(table, title="Black Market")
         elif sub == "buy":
             if len(args) < 2:
-                self.print("Usage: blackmarket buy <listing_id>", Color.GRAY)
+                self.set_output(Text("Usage: blackmarket buy <listing_id>",
+                                     style="dim"), title="Black Market")
                 return
             wealth = self.engine.world.get_component(self.engine.player, Wealth)
             result = self.blackmarket.buy_from_market(
@@ -1993,11 +2039,13 @@ class GameREPL:
             self.msg(result.get("message", "Done"),
                      Color.GREEN if result.get("success") else Color.RED)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Black Market")
 
     def cmd_fence(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: fence <item_name>", Color.GRAY)
+            self.set_output(Text("Usage: fence <item_name>", style="dim"),
+                            title="Fence")
             return
         item_name = " ".join(args).lower()
         inv = self.engine.inventories.get(self.engine.player.id)
@@ -2019,11 +2067,13 @@ class GameREPL:
                     if wealth:
                         wealth.copper += result.get("payout", 0)
                 return
-        self.print(f"You don't have any '{item_name}'.", Color.RED)
+        self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                        title="Fence")
 
     def cmd_hire_assassin(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: hire_assassin <target_id>", Color.GRAY)
+            self.set_output(Text("Usage: hire_assassin <target_id>", style="dim"),
+                            title="Hire Assassin")
             return
         markets = self.blackmarket.markets()
         if not markets:
@@ -2042,60 +2092,73 @@ class GameREPL:
 
     def cmd_factions(self, args: list[str]) -> None:
         from engine.factions.system import FactionLibrary
-        self.print_header("Factions", Color.GOLD)
+        table = Table(title="Factions", border_style="yellow")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Type", style="dim")
+        table.add_column("Description", style="dim")
         for f in FactionLibrary.all():
-            self.print(f"  #{f.id} {f.name}  ({f.type.value})", Color.WHITE)
-            self.print(f"    {f.description}", Color.GRAY)
-        self.print_separator()
+            table.add_row(str(f.id), f.name, f.type.value, f.description[:60])
+        self.set_output(table, title="Factions")
 
     def cmd_faction(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: faction <id>", Color.GRAY)
+            self.set_output(Text("Usage: faction <id>", style="dim"),
+                            title="Faction")
             return
         from engine.factions.system import FactionLibrary
         f = FactionLibrary.get(int(args[0]))
         if f is None:
-            self.print(f"Unknown faction: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown faction: {args[0]}", style="red"),
+                            title="Faction")
             return
-        self.print_header(f.name, Color.GOLD)
-        self.print(f"  Type: {f.type.value}", Color.WHITE)
-        self.print(f"  Leader: {f.leader_id}", Color.WHITE)
-        self.print(f"  Population: {f.population}", Color.WHITE)
-        self.print(f"  Military: {f.military_strength}", Color.WHITE)
-        self.print(f"  Treasury: {_format_money(f.treasury)}", Color.GOLD)
-        self.print(f"  {f.description}", Color.GRAY)
-        self.print_separator()
+        body = Text()
+        body.append(f"{f.name}\n", style="bold gold1")
+        body.append(f"Type: {f.type.value}\n", style="white")
+        body.append(f"Leader: {f.leader_id}\n", style="white")
+        body.append(f"Population: {f.population}\n", style="white")
+        body.append(f"Military: {f.military_strength}\n", style="white")
+        body.append(f"Treasury: {_format_money(f.treasury)}\n", style="gold1")
+        body.append(f"\n{f.description}\n", style="dim")
+        self.set_output(body, title=f.name)
 
     # ----- kingdoms -------------------------------------------------------- #
 
     def cmd_kingdoms(self, args: list[str]) -> None:
         from engine.kingdoms.system import KingdomLibrary
-        self.print_header("Kingdoms", Color.GOLD)
+        table = Table(title="Kingdoms", border_style="gold1")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Type", style="dim")
         for k in KingdomLibrary.all():
-            self.print(f"  #{k.id} {k.name}  ({k.kingdom_type.name})",
-                       color=Color.WHITE)
-        self.print_separator()
+            table.add_row(str(k.id), k.name, k.kingdom_type.name)
+        self.set_output(table, title="Kingdoms")
 
     def cmd_kingdom(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: kingdom <id>", Color.GRAY)
+            self.set_output(Text("Usage: kingdom <id>", style="dim"),
+                            title="Kingdom")
             return
         from engine.kingdoms.system import KingdomLibrary
         k = KingdomLibrary.get(int(args[0]))
         if k is None:
-            self.print(f"Unknown kingdom: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown kingdom: {args[0]}", style="red"),
+                            title="Kingdom")
             return
-        self.print_header(k.name, Color.GOLD)
-        self.print(f"  Type: {k.kingdom_type.name}", Color.WHITE)
-        self.print(f"  Ruler: {getattr(k, 'ruler_id', 'unknown')}", Color.WHITE)
-        self.print(f"  Stability: {getattr(k, 'stability', 0):.1f}", Color.WHITE)
-        self.print(f"  Legitimacy: {getattr(k, 'legitimacy', 0):.1f}", Color.WHITE)
-        self.print(f"  Treasury: {_format_money(getattr(k, 'treasury', 0))}", Color.GOLD)
-        self.print_separator()
+        body = Text()
+        body.append(f"{k.name}\n", style="bold gold1")
+        body.append(f"Type: {k.kingdom_type.name}\n", style="white")
+        body.append(f"Ruler: {getattr(k, 'ruler_id', 'unknown')}\n", style="white")
+        body.append(f"Stability: {getattr(k, 'stability', 0):.1f}\n", style="white")
+        body.append(f"Legitimacy: {getattr(k, 'legitimacy', 0):.1f}\n", style="white")
+        body.append(f"Treasury: {_format_money(getattr(k, 'treasury', 0))}\n",
+                    style="gold1")
+        self.set_output(body, title=k.name)
 
     def cmd_war(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: war <faction_a> <faction_b>", Color.GRAY)
+            self.set_output(Text("Usage: war <faction_a> <faction_b>", style="dim"),
+                            title="War")
             return
         self.engine.factions.declare_war(int(args[0]), int(args[1]),
                                           current_tick=self.engine.clock.time.tick)
@@ -2103,7 +2166,8 @@ class GameREPL:
 
     def cmd_peace(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: peace <faction_a> <faction_b>", Color.GRAY)
+            self.set_output(Text("Usage: peace <faction_a> <faction_b>", style="dim"),
+                            title="Peace")
             return
         self.engine.factions.make_peace(int(args[0]), int(args[1]),
                                          current_tick=self.engine.clock.time.tick)
@@ -2111,7 +2175,8 @@ class GameREPL:
 
     def cmd_alliance(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: alliance <kingdom_a> <kingdom_b>", Color.GRAY)
+            self.set_output(Text("Usage: alliance <kingdom_a> <kingdom_b>",
+                                 style="dim"), title="Alliance")
             return
         ok = self.kingdoms.form_alliance(int(args[0]), int(args[1]),
                                           current_tick=self.engine.clock.time.tick)
@@ -2120,7 +2185,8 @@ class GameREPL:
 
     def cmd_annex(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: annex <kingdom_id> <territory_id>", Color.GRAY)
+            self.set_output(Text("Usage: annex <kingdom_id> <territory_id>",
+                                 style="dim"), title="Annex")
             return
         ok = self.kingdoms.annex_territory(int(args[0]), int(args[1]))
         self.msg(f"Annexation {'succeeded' if ok else 'failed'}.",
@@ -2128,17 +2194,20 @@ class GameREPL:
 
     def cmd_election(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: election <kingdom_id>", Color.GRAY)
+            self.set_output(Text("Usage: election <kingdom_id>", style="dim"),
+                            title="Election")
             return
         winner = self.kingdoms.hold_election(int(args[0]),
                                               current_tick=self.engine.clock.time.tick)
-        self.msg(f"Election winner: {winner}", Color.GREEN if winner else Color.RED)
+        self.msg(f"Election winner: {winner}",
+                 Color.GREEN if winner else Color.RED)
 
     # ----- espionage ------------------------------------------------------- #
 
     def cmd_recruit_spy(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: recruit_spy <entity_id> <name>", Color.GRAY)
+            self.set_output(Text("Usage: recruit_spy <entity_id> <name>",
+                                 style="dim"), title="Recruit Spy")
             return
         spy = self.espionage.recruit_spy(
             int(args[0]), args[1], current_tick=self.engine.clock.time.tick,
@@ -2147,14 +2216,16 @@ class GameREPL:
 
     def cmd_mission(self, args: list[str]) -> None:
         if len(args) < 3:
-            self.print("Usage: mission <spy_id> <type> <target_faction>",
-                       color=Color.GRAY)
+            self.set_output(Text(
+                "Usage: mission <spy_id> <type> <target_faction>",
+                style="dim"), title="Mission")
             return
         from engine.espionage.system import MissionType
         try:
             mtype = MissionType[args[1].upper()]
         except KeyError:
-            self.print(f"Unknown mission type: {args[1]}", Color.RED)
+            self.set_output(Text(f"Unknown mission type: {args[1]}", style="red"),
+                            title="Mission")
             return
         m = self.espionage.assign_mission(
             int(args[0]), mtype, target_faction_id=int(args[2]),
@@ -2167,32 +2238,37 @@ class GameREPL:
 
     def cmd_resolve_mission(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: resolve_mission <mission_id>", Color.GRAY)
+            self.set_output(Text("Usage: resolve_mission <mission_id>",
+                                 style="dim"), title="Resolve Mission")
             return
         result = self.espionage.resolve_mission(int(args[0]),
                                                   current_tick=self.engine.clock.time.tick)
         self.msg(f"Mission result: {result.state.name}", Color.YELLOW)
 
     def cmd_spies(self, args: list[str]) -> None:
-        self.print_header("Spies", Color.GOLD)
+        table = Table(title="Spies", border_style="red")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Stealth", style="dim", justify="right")
         for s in self.espionage.spies():
-            self.print(f"  #{s.spy_id} {s.name}  stealth {s.stealth}",
-                       color=Color.WHITE)
+            table.add_row(str(s.spy_id), s.name, str(s.stealth))
         if not self.espionage.spies():
-            self.print("  No spies recruited.", Color.GRAY)
-        self.print_separator()
+            table.add_row("—", "(no spies recruited)", "")
+        self.set_output(table, title="Spies")
 
     # ----- rebellions ------------------------------------------------------ #
 
     def cmd_rebellion(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: rebellion <type> <faction_id>", Color.GRAY)
+            self.set_output(Text("Usage: rebellion <type> <faction_id>",
+                                 style="dim"), title="Rebellion")
             return
         from engine.rebellions.system import RebellionType
         try:
             rtype = RebellionType[args[0].upper()]
         except KeyError:
-            self.print(f"Unknown rebellion type: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown rebellion type: {args[0]}",
+                                 style="red"), title="Rebellion")
             return
         r = self.rebellions.start_rebellion(
             name=f"{rtype.value} #{args[1]}", rebellion_type=rtype,
@@ -2202,7 +2278,8 @@ class GameREPL:
 
     def cmd_suppress(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: suppress <rebellion_id>", Color.GRAY)
+            self.set_output(Text("Usage: suppress <rebellion_id>", style="dim"),
+                            title="Suppress")
             return
         ok = self.rebellions.suppress_rebellion(int(args[0]),
                                                   current_tick=self.engine.clock.time.tick)
@@ -2211,7 +2288,8 @@ class GameREPL:
 
     def cmd_negotiate(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: negotiate <rebellion_id>", Color.GRAY)
+            self.set_output(Text("Usage: negotiate <rebellion_id>", style="dim"),
+                            title="Negotiate")
             return
         ok = self.rebellions.negotiate_settlement(int(args[0]),
                                                     current_tick=self.engine.clock.time.tick)
@@ -2222,11 +2300,13 @@ class GameREPL:
 
     def cmd_diseases(self, args: list[str]) -> None:
         from engine.survival.system import DiseaseLibrary
-        self.print_header("Diseases", Color.GOLD)
+        table = Table(title="Diseases", border_style="red")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="red")
+        table.add_column("Description", style="dim")
         for d in DiseaseLibrary.all():
-            self.print(f"  {d.id:20s} {d.name}", Color.RED)
-            self.print(f"    {d.description}", Color.GRAY)
-        self.print_separator()
+            table.add_row(d.id, d.name, d.description[:60])
+        self.set_output(table, title="Diseases")
 
     def cmd_cure(self, args: list[str]) -> None:
         diseases = self.engine.survival.diseases_of(self.engine.player)
@@ -2234,12 +2314,13 @@ class GameREPL:
             self.msg("You have no diseases.", Color.GREEN)
             return
         if not args:
-            self.print("Usage: cure <disease_id>", Color.GRAY)
-            self.print("You have:", Color.YELLOW)
+            body = Text("You have:\n", style="yellow")
             for d in diseases:
-                self.print(f"  {d.disease_id} (severity {d.severity:.1f})", Color.RED)
+                body.append(f"  {d.disease_id} (severity {d.severity:.1f})\n",
+                            style="red")
+            body.append("\nUsage: cure <disease_id>", style="dim")
+            self.set_output(body, title="Cure")
             return
-        # Simple cure: just remove the disease
         for d in diseases:
             if d.disease_id == args[0]:
                 d.severity = 0
@@ -2250,11 +2331,13 @@ class GameREPL:
 
     def cmd_marry(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: marry <partner_name>", Color.GRAY)
+            self.set_output(Text("Usage: marry <partner_name>", style="dim"),
+                            title="Marry")
             return
         partner = self._find_entity_by_name(" ".join(args))
         if partner is None:
-            self.print("No such person nearby.", Color.RED)
+            self.set_output(Text("No such person nearby.", style="red"),
+                            title="Marry")
             return
         marriage = self.life.marry(
             self.engine.world, self.engine.player, partner,
@@ -2278,40 +2361,44 @@ class GameREPL:
 
     def cmd_family(self, args: list[str]) -> None:
         family = self.life.family_of(self.engine.player.id)
-        self.print_header("Family", Color.GOLD)
+        body = Text()
         if family is None:
-            self.print("  You have no family.", Color.GRAY)
+            body.append("You have no family.\n", style="dim")
         else:
-            self.print(f"  Family: {family.surname}", Color.WHITE)
-            self.print(f"  Wealth class: {family.wealth_class}", Color.WHITE)
-            self.print(f"  Members: {len(family.members)}", Color.WHITE)
+            body.append(f"Family: {family.surname}\n", style="white")
+            body.append(f"Wealth class: {family.wealth_class}\n", style="white")
+            body.append(f"Members: {len(family.members)}\n", style="white")
         marriage = self.life.marriage_of(self.engine.player.id)
         if marriage:
-            self.print(f"  Married to entity #{marriage.spouse_a if marriage.spouse_b == self.engine.player.id else marriage.spouse_b}",
-                       color=Color.PINK)
-        self.print_separator()
+            body.append(f"Married to entity #{marriage.spouse_a if marriage.spouse_b == self.engine.player.id else marriage.spouse_b}\n",
+                        style="magenta")
+        self.set_output(body, title="Family")
 
     def cmd_job(self, args: list[str]) -> None:
         postings = self.life.job_market.all()
-        self.print_header("Job Market", Color.GOLD)
+        table = Table(title="Job Market", border_style="yellow")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Title", style="white")
+        table.add_column("Salary", style="gold1", justify="right")
         for p in postings[:10]:
-            self.print(f"  #{p.posting_id} {p.title}  salary: {p.salary}cp/mo",
-                       color=Color.WHITE)
+            table.add_row(str(p.posting_id), p.title, f"{p.salary}cp/mo")
         if not postings:
-            self.print("  No jobs available.", Color.GRAY)
-        self.print_separator()
+            table.add_row("—", "(no jobs available)", "")
+        self.set_output(table, title="Job Market")
 
     # ----- dungeons & exploration ----------------------------------------- #
 
     def cmd_dungeon(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: dungeon <type> [depth]", Color.GRAY)
+            self.set_output(Text("Usage: dungeon <type> [depth]", style="dim"),
+                            title="Dungeon")
             return
         from engine.dungeons.system import DungeonType
         try:
             dtype = DungeonType[args[0].upper()]
         except KeyError:
-            self.print(f"Unknown dungeon type: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown dungeon type: {args[0]}", style="red"),
+                            title="Dungeon")
             return
         depth = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
         pos = self.engine.world.get_component(self.engine.player, Position)
@@ -2321,21 +2408,24 @@ class GameREPL:
             dungeon_type=dtype, location=loc, depth=depth,
             dungeon_id=self.engine.rng.randint(1, 99999),
         )
+        body = Text()
+        body.append(f"{d.name}\n", style="bold gold1")
+        body.append(f"Type: {d.dungeon_type.value}\n", style="white")
+        body.append(f"Depth: {d.depth}\n", style="white")
+        body.append(f"Location: {d.location}\n", style="dim")
         self.msg(f"Dungeon generated: {d.name} ({d.depth} levels)", Color.GREEN)
-        self.print_header(d.name, Color.GOLD)
-        self.print(f"  Type: {d.dungeon_type.value}", Color.WHITE)
-        self.print(f"  Depth: {d.depth}", Color.WHITE)
-        self.print(f"  Location: {d.location}", Color.GRAY)
-        self.print_separator()
+        self.set_output(body, title="Dungeon")
 
     def cmd_bookmark(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: bookmark <add|list|remove> ...", Color.GRAY)
+            self.set_output(Text("Usage: bookmark <add|list|remove> ...",
+                                 style="dim"), title="Bookmark")
             return
         sub = args[0].lower()
         if sub == "add":
             if len(args) < 2:
-                self.print("Usage: bookmark add <name>", Color.GRAY)
+                self.set_output(Text("Usage: bookmark add <name>", style="dim"),
+                                title="Bookmark")
                 return
             name = " ".join(args[1:])
             pos = self.engine.world.get_component(self.engine.player, Position)
@@ -2343,26 +2433,32 @@ class GameREPL:
                                              pos.y if pos else 0)
             self.msg(f"Bookmark '{b.name}' added at ({b.x}, {b.y}).", Color.GREEN)
         elif sub == "list":
-            self.print_header("Bookmarks", Color.GOLD)
-            for b in self.bookmarks.all_bookmarks():
-                self.print(f"  #{b.bookmark_id} {b.name} ({b.x}, {b.y})",
-                           color=Color.WHITE)
-            if not self.bookmarks.all_bookmarks():
-                self.print("  No bookmarks.", Color.GRAY)
-            self.print_separator()
+            table = Table(title="Bookmarks", border_style="cyan")
+            table.add_column("ID", style="cyan", justify="right")
+            table.add_column("Name", style="white")
+            table.add_column("Location", style="dim")
+            bms = list(self.bookmarks.all_bookmarks())
+            for b in bms:
+                table.add_row(str(b.bookmark_id), b.name, f"({b.x}, {b.y})")
+            if not bms:
+                table.add_row("—", "(no bookmarks)", "")
+            self.set_output(table, title="Bookmarks")
         elif sub == "remove":
             if len(args) < 2:
-                self.print("Usage: bookmark remove <id>", Color.GRAY)
+                self.set_output(Text("Usage: bookmark remove <id>", style="dim"),
+                                title="Bookmark")
                 return
             ok = self.bookmarks.remove_bookmark(int(args[1]))
             self.msg("Bookmark removed." if ok else "Not found.",
                      Color.GREEN if ok else Color.RED)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Bookmark")
 
     def cmd_pin(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: pin <x> <y> [label]", Color.GRAY)
+            self.set_output(Text("Usage: pin <x> <y> [label]", style="dim"),
+                            title="Pin")
             return
         x, y = int(args[0]), int(args[1])
         label = " ".join(args[2:]) if len(args) > 2 else ""
@@ -2373,7 +2469,8 @@ class GameREPL:
 
     def cmd_hunt(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: hunt <species_id>", Color.GRAY)
+            self.set_output(Text("Usage: hunt <species_id>", style="dim"),
+                            title="Hunt")
             return
         from engine.entities.components import Skills as SkillsComp
         comp = self.engine.world.get_component(self.engine.player, SkillsComp)
@@ -2384,7 +2481,8 @@ class GameREPL:
 
     def cmd_tame(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: tame <species_id>", Color.GRAY)
+            self.set_output(Text("Usage: tame <species_id>", style="dim"),
+                            title="Tame")
             return
         result = self.animals.domestication.tame_attempt(
             args[0], self.engine.player.id, skill_level=1,
@@ -2393,54 +2491,65 @@ class GameREPL:
         self.msg(f"Tame attempt: {result}", Color.YELLOW)
 
     def cmd_livestock(self, args: list[str]) -> None:
-        self.print_header("Livestock", Color.GOLD)
         herds = self.animals.livestock.herd_of(self.engine.player.id)
+        table = Table(title="Livestock", border_style="yellow")
+        table.add_column("Species", style="cyan")
+        table.add_column("Count", style="white", justify="right")
         if herds:
             for species_id, count in herds.items():
-                self.print(f"  {species_id:20s} x{count}", Color.WHITE)
+                table.add_row(species_id, str(count))
         else:
-            self.print("  No livestock.", Color.GRAY)
-        self.print_separator()
+            table.add_row("(none)", "")
+        self.set_output(table, title="Livestock")
 
     def cmd_animals(self, args: list[str]) -> None:
         from engine.animals.system import AnimalLibrary
-        self.print_header("Animal Species", Color.GOLD)
+        table = Table(title="Animal Species", border_style="green")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="white")
         for s in AnimalLibrary.all():
-            sid = getattr(s, 'id', getattr(s, 'species_id', '?'))
-            self.print(f"  {sid:20s} {s.name}", Color.WHITE)
-        self.print_separator()
+            sid = getattr(s, "id", getattr(s, "species_id", "?"))
+            table.add_row(sid, s.name)
+        self.set_output(table, title="Animals")
 
     # ----- artifacts ------------------------------------------------------- #
 
     def cmd_artifacts(self, args: list[str]) -> None:
         from engine.artifacts.system import ArtifactLibrary
-        self.print_header("Artifacts", Color.GOLD)
+        table = Table(title="Artifacts", border_style="magenta")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="white")
+        table.add_column("Rarity", style="magenta")
+        table.add_column("Owner", style="dim", justify="right")
         for a in ArtifactLibrary.all():
-            self.print(f"  {a.artifact_id:25s} {a.name}", Color.WHITE)
-            self.print(f"    rarity: {a.rarity.value}  owner: {a.owner_id}",
-                       color=Color.GRAY)
-        self.print_separator()
+            table.add_row(a.artifact_id, a.name, a.rarity.value,
+                          str(a.owner_id) if a.owner_id is not None else "—")
+        self.set_output(table, title="Artifacts")
 
     def cmd_wield(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: wield <artifact_id>", Color.GRAY)
+            self.set_output(Text("Usage: wield <artifact_id>", style="dim"),
+                            title="Wield")
             return
         from engine.artifacts.system import ArtifactLibrary
         artifact = ArtifactLibrary.get(args[0])
         if artifact is None:
-            self.print(f"Unknown artifact: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown artifact: {args[0]}", style="red"),
+                            title="Wield")
             return
         self.artifacts.wield(artifact, self.engine.player.id)
         self.msg(f"You wield {artifact.name}.", Color.GREEN)
 
     def cmd_power(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: power <artifact_id> <power_name>", Color.GRAY)
+            self.set_output(Text("Usage: power <artifact_id> <power_name>",
+                                 style="dim"), title="Power")
             return
         from engine.artifacts.system import ArtifactLibrary
         artifact = ArtifactLibrary.get(args[0])
         if artifact is None:
-            self.print(f"Unknown artifact: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown artifact: {args[0]}", style="red"),
+                            title="Power")
             return
         ok, msg = self.artifacts.use_power(artifact, args[1],
                                             current_tick=self.engine.clock.time.tick)
@@ -2448,12 +2557,14 @@ class GameREPL:
 
     def cmd_talk_artifact(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: talk_artifact <artifact_id>", Color.GRAY)
+            self.set_output(Text("Usage: talk_artifact <artifact_id>",
+                                 style="dim"), title="Talk Artifact")
             return
         from engine.artifacts.system import ArtifactLibrary
         artifact = ArtifactLibrary.get(args[0])
         if artifact is None:
-            self.print(f"Unknown artifact: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown artifact: {args[0]}", style="red"),
+                            title="Talk Artifact")
             return
         response = self.artifacts.communicate(artifact, "Hello, mighty artifact.")
         if response:
@@ -2463,12 +2574,14 @@ class GameREPL:
 
     def cmd_destroy(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: destroy <artifact_id> <method>", Color.GRAY)
+            self.set_output(Text("Usage: destroy <artifact_id> <method>",
+                                 style="dim"), title="Destroy")
             return
         from engine.artifacts.system import ArtifactLibrary
         artifact = ArtifactLibrary.get(args[0])
         if artifact is None:
-            self.print(f"Unknown artifact: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown artifact: {args[0]}", style="red"),
+                            title="Destroy")
             return
         ok, msg = self.artifacts.attempt_destroy(artifact, args[1])
         self.msg(msg, Color.GREEN if ok else Color.RED)
@@ -2477,30 +2590,30 @@ class GameREPL:
 
     def cmd_reputation(self, args: list[str]) -> None:
         from engine.reputation.system import ReputationType
-        self.print_header("Reputation", Color.GOLD)
+        table = Table(title="Reputation", border_style="yellow")
+        table.add_column("Type", style="cyan")
+        table.add_column("Level", style="white")
+        table.add_column("Value", style="dim", justify="right")
         for rt in ReputationType:
             level = self.reputation.level(self.engine.player.id, rt)
             value = self.reputation.get(self.engine.player.id, rt)
-            level_name = level.name if hasattr(level, 'name') else str(level)
-            rt_name = rt.name if hasattr(rt, 'name') else str(rt)
-            self.print(f"  {rt_name:12s} {level_name:12s} ({value:+.0f})",
-                       color=Color.WHITE)
-        self.print_separator()
+            level_name = level.name if hasattr(level, "name") else str(level)
+            rt_name = rt.name if hasattr(rt, "name") else str(rt)
+            table.add_row(rt_name, level_name, f"{value:+.0f}")
+        self.set_output(table, title="Reputation")
 
     def cmd_hero(self, args: list[str]) -> None:
         deed = " ".join(args) if args else "a heroic deed"
-        self.reputation.adjust(self.engine.player.id,
-                               __import__("engine.reputation.system",
-                                          fromlist=["ReputationType"]).ReputationType.HEROIC,
+        from engine.reputation.system import ReputationType
+        self.reputation.adjust(self.engine.player.id, ReputationType.HEROIC,
                                10, reason=deed,
                                current_tick=self.engine.clock.time.tick)
         self.msg(f"You perform {deed}. (+10 heroic reputation)", Color.GREEN)
 
     def cmd_crime(self, args: list[str]) -> None:
         crime = " ".join(args) if args else "a petty crime"
-        self.reputation.adjust(self.engine.player.id,
-                               __import__("engine.reputation.system",
-                                          fromlist=["ReputationType"]).ReputationType.CRIMINAL,
+        from engine.reputation.system import ReputationType
+        self.reputation.adjust(self.engine.player.id, ReputationType.CRIMINAL,
                                -10, reason=crime,
                                current_tick=self.engine.clock.time.tick)
         self.msg(f"You commit {crime}. (-10 criminal reputation)", Color.RED)
@@ -2509,7 +2622,8 @@ class GameREPL:
 
     def cmd_stealth(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: stealth <on|off>", Color.GRAY)
+            self.set_output(Text("Usage: stealth <on|off>", style="dim"),
+                            title="Stealth")
             return
         if args[0].lower() == "on":
             ok = self.stealth.enter_stealth(self.engine.player)
@@ -2519,18 +2633,21 @@ class GameREPL:
             self.stealth.exit_stealth(self.engine.player)
             self.msg("You exit stealth.", Color.GRAY)
         else:
-            self.print("Usage: stealth <on|off>", Color.GRAY)
+            self.set_output(Text("Usage: stealth <on|off>", style="dim"),
+                            title="Stealth")
 
     def cmd_backstab(self, args: list[str]) -> None:
         if not args:
             target = self._find_adjacent_hostile()
             if target is None:
-                self.print("Backstab what?", Color.GRAY)
+                self.set_output(Text("Backstab what?", style="dim"),
+                                title="Backstab")
                 return
         else:
             target = self._find_entity_by_name(" ".join(args))
             if target is None:
-                self.print(f"You don't see any '{' '.join(args)}' here.", Color.RED)
+                self.set_output(Text(f"You don't see any '{' '.join(args)}' here.",
+                                     style="red"), title="Backstab")
                 return
         bonus = self.stealth.backstab_bonus(self.engine.player, target)
         comp = self.engine.world.get_component(self.engine.player, CombatComp)
@@ -2551,39 +2668,46 @@ class GameREPL:
     def cmd_theme(self, args: list[str]) -> None:
         from engine.themes.system import ThemeLibrary
         if not args:
-            self.print("Usage: theme <list|set> ...", Color.GRAY)
+            self.set_output(Text("Usage: theme <list|set> ...", style="dim"),
+                            title="Theme")
             return
         sub = args[0].lower()
         if sub == "list":
-            self.print_header("Themes", Color.GOLD)
+            table = Table(title="Themes", border_style="magenta")
+            table.add_column("Name", style="white")
             for name in ThemeLibrary.names():
-                self.print(f"  {name}", Color.WHITE)
-            self.print_separator()
+                table.add_row(name)
+            self.set_output(table, title="Themes")
         elif sub == "set":
             if len(args) < 2:
-                self.print("Usage: theme set <name>", Color.GRAY)
+                self.set_output(Text("Usage: theme set <name>", style="dim"),
+                                title="Theme")
                 return
             theme = ThemeLibrary.get(args[1])
             if theme is None:
-                self.print(f"Unknown theme: {args[1]}", Color.RED)
+                self.set_output(Text(f"Unknown theme: {args[1]}", style="red"),
+                                title="Theme")
                 return
-            self._theme = theme
             self.msg(f"Theme set to {theme.name}.", Color.GREEN)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Theme")
 
     def cmd_dimensions(self, args: list[str]) -> None:
-        self.print_header("Dimensions", Color.GOLD)
+        table = Table(title="Dimensions", border_style="cyan")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Type", style="dim")
         for d in self.dimensions.all_dimensions():
-            self.print(f"  #{d.dimension_id} {d.name}  ({d.dimension_type.value})",
-                       color=Color.WHITE)
+            table.add_row(str(d.dimension_id), d.name, d.dimension_type.value)
         if not self.dimensions.all_dimensions():
-            self.print("  No dimensions discovered.", Color.GRAY)
-        self.print_separator()
+            table.add_row("—", "(none discovered)", "")
+        self.set_output(table, title="Dimensions")
 
     def cmd_portal(self, args: list[str]) -> None:
         if len(args) < 2:
-            self.print("Usage: portal <from_dim> <to_dim>", Color.GRAY)
+            self.set_output(Text("Usage: portal <from_dim> <to_dim>", style="dim"),
+                            title="Portal")
             return
         ok = self.dimensions.open_portal(int(args[0]), int(args[1]))
         self.msg(f"Portal {'opened' if ok else 'failed to open'}.",
@@ -2591,7 +2715,8 @@ class GameREPL:
 
     def cmd_travel(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: travel <dimension_id>", Color.GRAY)
+            self.set_output(Text("Usage: travel <dimension_id>", style="dim"),
+                            title="Travel")
             return
         ok, msg = self.dimensions.can_travel(0, int(args[0]))
         self.msg(msg, Color.GREEN if ok else Color.RED)
@@ -2600,26 +2725,29 @@ class GameREPL:
 
     def cmd_bodyparts(self, args: list[str]) -> None:
         parts = self.bodyparts.body_parts(self.engine.player)
-        self.print_header("Body Parts", Color.GOLD)
-        for p in parts:
-            status = "OK" if p.status.name == "HEALTHY" else p.status.name
-            self.print(f"  {p.part_type.value:12s} HP {p.current_hp}/{p.max_hp}  {status}",
-                       color=Color.WHITE)
         if not parts:
             self.bodyparts.assign_body(self.engine.player, "humanoid")
-            self.print("  Body assigned. Use 'bodyparts' again to view.",
-                       color=Color.GRAY)
-        self.print_separator()
+            parts = self.bodyparts.body_parts(self.engine.player)
+        table = Table(title="Body Parts", border_style="red")
+        table.add_column("Part", style="cyan")
+        table.add_column("HP", style="red", justify="right")
+        table.add_column("Status", style="white")
+        for p in parts:
+            status = "OK" if p.status.name == "HEALTHY" else p.status.name
+            table.add_row(p.part_type.value, f"{p.current_hp}/{p.max_hp}", status)
+        self.set_output(table, title="Body Parts")
 
     def cmd_heal_part(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: heal_part <part_type> [amount]", Color.GRAY)
+            self.set_output(Text("Usage: heal_part <part_type> [amount]",
+                                 style="dim"), title="Heal Part")
             return
         from engine.bodyparts.system import BodyPartType
         try:
             ptype = BodyPartType[args[0].upper()]
         except KeyError:
-            self.print(f"Unknown part: {args[0]}", Color.RED)
+            self.set_output(Text(f"Unknown part: {args[0]}", style="red"),
+                            title="Heal Part")
             return
         amount = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
         self.bodyparts.heal_part(self.engine.player, ptype, amount)
@@ -2631,38 +2759,45 @@ class GameREPL:
         hours = float(args[0]) if args and args[0].replace(".", "").isdigit() else 24.0
         report = self.background_sim.simulate(hours,
                                                start_tick=self.engine.clock.time.tick)
-        self.print_header(f"Background Simulation ({hours:.0f}h)", Color.GOLD)
-        total = getattr(report, 'total_events', 0)
-        major = getattr(report, 'major_events', [])
-        self.print(f"  Total events: {total}", Color.WHITE)
-        self.print(f"  Major events: {len(major)}", Color.WHITE)
+        body = Text()
+        total = getattr(report, "total_events", 0)
+        major = getattr(report, "major_events", [])
+        body.append(f"Total events: {total}\n", style="white")
+        body.append(f"Major events: {len(major)}\n", style="white")
         for ev in major[:5]:
-            etype = getattr(ev, 'event_type', None)
-            etype_name = etype.name if hasattr(etype, 'name') else str(etype)
-            desc = getattr(ev, 'description', '')
-            self.print(f"    {etype_name}: {desc}", Color.YELLOW)
-        self.print_separator()
+            etype = getattr(ev, "event_type", None)
+            etype_name = etype.name if hasattr(etype, "name") else str(etype)
+            desc = getattr(ev, "description", "")
+            body.append(f"  {etype_name}: {desc}\n", style="yellow")
+        self.set_output(body, title=f"Simulation ({hours:.0f}h)")
 
     def cmd_contentpacks(self, args: list[str]) -> None:
         from engine.content_packs.system import ContentPackManager
         cpm = ContentPackManager()
         count = cpm.discover()
-        self.print_header("Content Packs", Color.GOLD)
-        self.print(f"  Discovered: {count}", Color.WHITE)
+        table = Table(title="Content Packs", border_style="magenta")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="white")
+        table.add_column("Version", style="dim")
+        body = Text(f"Discovered: {count}\n", style="white")
         for p in cpm.registry.all():
-            self.print(f"  {p.pack_id:25s} {p.name} v{p.version}", Color.WHITE)
-        self.print_separator()
+            table.add_row(p.pack_id, p.name, p.version)
+        if not cpm.registry.all():
+            table.add_row("—", "(none)", "")
+        self.set_output(Group(body, table), title="Content Packs")
 
     # ----- combat variants ------------------------------------------------- #
 
     def cmd_naval(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: naval <bombard|board> <ship_id>", Color.GRAY)
+            self.set_output(Text("Usage: naval <bombard|board> <ship_id>",
+                                 style="dim"), title="Naval")
             return
         sub = args[0].lower()
         if sub == "bombard":
             if len(args) < 2:
-                self.print("Usage: naval bombard <target_ship_id>", Color.GRAY)
+                self.set_output(Text("Usage: naval bombard <target_ship_id>",
+                                     style="dim"), title="Naval")
                 return
             ships = self.naval_combat.all_ships()
             if not ships:
@@ -2675,7 +2810,8 @@ class GameREPL:
             self.msg(result.message, Color.YELLOW)
         elif sub == "board":
             if len(args) < 2:
-                self.print("Usage: naval board <target_ship_id>", Color.GRAY)
+                self.set_output(Text("Usage: naval board <target_ship_id>",
+                                     style="dim"), title="Naval")
                 return
             ships = self.naval_combat.all_ships()
             if not ships:
@@ -2686,17 +2822,20 @@ class GameREPL:
             result = self.naval_combat.board(ship, target)
             self.msg(result.message, Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Naval")
 
     def cmd_siege(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: siege <create|bombard|assault> ...", Color.GRAY)
+            self.set_output(Text("Usage: siege <create|bombard|assault> ...",
+                                 style="dim"), title="Siege")
             return
         sub = args[0].lower()
         if sub == "create":
             if len(args) < 3:
-                self.print("Usage: siege create <attacker_faction> <defender_faction>",
-                           color=Color.GRAY)
+                self.set_output(Text(
+                    "Usage: siege create <attacker_faction> <defender_faction>",
+                    style="dim"), title="Siege")
                 return
             s = self.siege_combat.create_siege(
                 int(args[1]), int(args[2]), "Fortress",
@@ -2705,22 +2844,26 @@ class GameREPL:
             self.msg(f"Siege {s.siege_id} created.", Color.RED)
         elif sub == "bombard":
             if len(args) < 2:
-                self.print("Usage: siege bombard <siege_id>", Color.GRAY)
+                self.set_output(Text("Usage: siege bombard <siege_id>",
+                                     style="dim"), title="Siege")
                 return
             result = self.siege_combat.bombard(int(args[1]))
             self.msg(f"Bombardment: {result}", Color.YELLOW)
         elif sub == "assault":
             if len(args) < 3:
-                self.print("Usage: siege assault <siege_id> <troops>", Color.GRAY)
+                self.set_output(Text("Usage: siege assault <siege_id> <troops>",
+                                     style="dim"), title="Siege")
                 return
             result = self.siege_combat.assault(int(args[1]), int(args[2]))
             self.msg(f"Assault: {result}", Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Siege")
 
     def cmd_aerial(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: aerial <mount|dive|attack> ...", Color.GRAY)
+            self.set_output(Text("Usage: aerial <mount|dive|attack> ...",
+                                 style="dim"), title="Aerial")
             return
         sub = args[0].lower()
         if sub == "mount":
@@ -2733,19 +2876,22 @@ class GameREPL:
         elif sub == "attack":
             target = self._find_adjacent_hostile()
             if target is None:
-                self.print("No target.", Color.GRAY)
+                self.set_output(Text("No target.", style="dim"),
+                                title="Aerial")
                 return
             result = self.aerial_combat.aerial_attack(
                 self.engine.world, self.engine.player, target,
             )
-            self.msg(f"Aerial attack: {result.message if hasattr(result, 'message') else result}",
-                     Color.YELLOW)
+            msg = result.message if hasattr(result, "message") else str(result)
+            self.msg(f"Aerial attack: {msg}", Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Aerial")
 
     def cmd_space(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: space <fire|launch> ...", Color.GRAY)
+            self.set_output(Text("Usage: space <fire|launch> ...", style="dim"),
+                            title="Space")
             return
         sub = args[0].lower()
         if sub == "fire":
@@ -2756,7 +2902,8 @@ class GameREPL:
             attacker = ships[0]
             target = ships[-1] if len(ships) > 1 else None
             if target is None:
-                self.print("Need a target ship.", Color.GRAY)
+                self.set_output(Text("Need a target ship.", style="dim"),
+                                title="Space")
                 return
             if not attacker.weapons:
                 self.space_combat.add_weapon(attacker, "laser", "Main Laser")
@@ -2770,17 +2917,20 @@ class GameREPL:
             result = self.space_combat.launch_fighters(ships[0], ships[-1])
             self.msg(f"Launch: {result}", Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Space")
 
     def cmd_realtime(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: realtime <queue|cancel> ...", Color.GRAY)
+            self.set_output(Text("Usage: realtime <queue|cancel> ...",
+                                 style="dim"), title="Realtime")
             return
         sub = args[0].lower()
         if sub == "queue":
             target = self._find_adjacent_hostile()
             if target is None:
-                self.print("No target.", Color.GRAY)
+                self.set_output(Text("No target.", style="dim"),
+                                title="Realtime")
                 return
             action = self.realtime_combat.queue_attack(self.engine.player, target)
             self.msg(f"Attack queued (action {action.action_id}).", Color.YELLOW)
@@ -2788,11 +2938,13 @@ class GameREPL:
             n = self.realtime_combat.cancel_actions(self.engine.player)
             self.msg(f"Cancelled {n} actions.", Color.GRAY)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Realtime")
 
     def cmd_mount(self, args: list[str]) -> None:
         if not args:
-            self.print("Usage: mount <mount|dismount|charge> ...", Color.GRAY)
+            self.set_output(Text("Usage: mount <mount|dismount|charge> ...",
+                                 style="dim"), title="Mount")
             return
         sub = args[0].lower()
         if sub == "mount":
@@ -2805,15 +2957,17 @@ class GameREPL:
         elif sub == "charge":
             target = self._find_adjacent_hostile()
             if target is None:
-                self.print("No target.", Color.GRAY)
+                self.set_output(Text("No target.", style="dim"),
+                                title="Mount")
                 return
             result = self.mounted_combat.mounted_attack(
                 self.engine.world, self.engine.player, target, is_charging=True,
             )
-            self.msg(f"Charge: {result.message if hasattr(result, 'message') else result}",
-                     Color.YELLOW)
+            msg = result.message if hasattr(result, "message") else str(result)
+            self.msg(f"Charge: {msg}", Color.YELLOW)
         else:
-            self.print(f"Unknown subcommand: {sub}", Color.RED)
+            self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                            title="Mount")
 
     # ----- entity lookup --------------------------------------------------- #
 
@@ -2890,15 +3044,17 @@ class GameREPL:
         health = self.engine.world.get_component(entity, Health)
         position = self.engine.world.get_component(entity, Position)
         if identity is None:
-            self.print("You see nothing of interest.", Color.GRAY)
+            self.set_output(Text("You see nothing of interest.", style="dim"),
+                            title="Look")
             return
-        self.print_header(identity.display_name, identity.color)
+        body = Text()
+        body.append(f"{identity.display_name}\n", style="bold gold1")
         if identity.description:
-            self.print(f"  {identity.description}", Color.GRAY)
+            body.append(f"{identity.description}\n", style="dim")
         if health:
-            self.print(f"  HP: {health.current}/{health.maximum}", Color.HEALTH)
+            body.append(f"HP: {health.current}/{health.maximum}\n", style="red")
         if position:
-            self.print(f"  Position: ({position.x}, {position.y})", Color.GRAY)
+            body.append(f"Position: ({position.x}, {position.y})\n", style="dim")
         tags = []
         if self.engine.world.has_tag(entity, "hostile"):
             tags.append("hostile")
@@ -2907,63 +3063,50 @@ class GameREPL:
         if self.engine.world.has_tag(entity, "creature"):
             tags.append("creature")
         if tags:
-            self.print(f"  Tags: {', '.join(tags)}", Color.GRAY)
-        self.print_separator()
+            body.append(f"Tags: {', '.join(tags)}\n", style="dim")
+        self.set_output(body, title=identity.display_name)
 
     # ----- main loop ------------------------------------------------------- #
 
     def run(self) -> None:
         self.running = True
-        self.enable_raw_mode()
+        # Enable raw mode only when stdin is a real TTY.
+        if self._interactive:
+            self.enable_raw_mode()
         try:
-            self.print()
-            self.print("╔══════════════════════════════════════════════════════════╗",
-                       color=Color.GOLD)
-            self.print("║                                                          ║",
-                       color=Color.GOLD)
-            self.print("║            A E O N   E N G I N E                         ║",
-                       color=Color.GOLD)
-            self.print("║       A Text-Based Open-World RPG                        ║",
-                       color=Color.GOLD)
-            self.print("║                                                          ║",
-                       color=Color.GOLD)
-            self.print("╚══════════════════════════════════════════════════════════╝",
-                       color=Color.GOLD)
-            self.print()
-            self.print("Type 'help' for commands, 'q' to quit.", Color.CYAN)
-            if self._raw_mode:
-                self.print("Use hjkl/wasd/arrows for movement (no Enter needed).",
-                           color=Color.CYAN)
-            else:
-                self.print("Line mode: type a command and press Enter.", Color.CYAN)
-            self.print()
-            self._refresh_display()
+            # Initial render — banner is always visible at the top of the layout.
+            self._render()
             while self.running:
                 try:
                     self._tick()
                 except KeyboardInterrupt:
-                    self.print("\nUse 'quit' to exit.", Color.YELLOW)
+                    self.msg("Use 'quit' to exit.", Color.YELLOW)
+                    self._render()
                 except Exception as exc:  # noqa: BLE001
                     log.exception("REPL error")
-                    self.print(f"Error: {exc}", Color.RED)
+                    self.set_output(Text(f"Error: {exc}", style="red"),
+                                    title="Error")
+                    self._render()
         finally:
             self.disable_raw_mode()
+            # Print a final newline so the shell prompt isn't on the same line.
+            try:
+                print()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _tick(self) -> None:
-        if self._in_dialogue:
-            sys.stdout.write("Choice> ")
-        else:
-            sys.stdout.write("> ")
-        sys.stdout.flush()
+        # Read input.
         line = ""
         if self._raw_mode:
+            sys.stdout.flush()
             key = self._read_key()
             if key == "quit":
                 self.running = False
                 return
             if key == "enter":
                 self.engine.tick_simulation(0.05)
-                self._refresh_display()
+                self._render()
                 return
             if key in ("up", "down"):
                 if key == "up" and self._history:
@@ -2972,7 +3115,7 @@ class GameREPL:
                 elif key == "down" and self._history:
                     self._history_idx = min(len(self._history) - 1, self._history_idx + 1)
                     line = self._history[self._history_idx] if self._history_idx >= 0 else ""
-                sys.stdout.write("\r" + " " * 40 + "\r> " + line)
+                sys.stdout.write("\r" + " " * 60 + "\r" + line)
                 sys.stdout.flush()
                 while True:
                     k = self._read_key()
@@ -2983,12 +3126,11 @@ class GameREPL:
                         return
                     if k == "backspace" and line:
                         line = line[:-1]
-                        sys.stdout.write("\r> " + line + " ")
-                        sys.stdout.write("\r> " + line)
+                        sys.stdout.write("\r" + line + "  \r" + line)
                         sys.stdout.flush()
                     elif len(k) == 1 and k.isprintable():
                         line += k
-                        sys.stdout.write(line[-1])
+                        sys.stdout.write(k)
                         sys.stdout.flush()
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -2999,6 +3141,8 @@ class GameREPL:
                     sys.stdout.flush()
                 else:
                     line = key
+                    sys.stdout.write(key)
+                    sys.stdout.flush()
                     while True:
                         k = self._read_key()
                         if k == "enter":
@@ -3008,20 +3152,23 @@ class GameREPL:
                             return
                         if k == "backspace" and line:
                             line = line[:-1]
-                            sys.stdout.write("\r> " + line + " ")
-                            sys.stdout.write("\r> " + line)
+                            sys.stdout.write("\r" + line + "  \r" + line)
                             sys.stdout.flush()
                         elif len(k) == 1 and k.isprintable():
                             line += k
                             sys.stdout.write(k)
                             sys.stdout.flush()
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
             else:
                 return
         else:
+            # Line-mode: prompt via rich to keep styling consistent.
             try:
-                line = input()
+                if self._in_dialogue:
+                    line = input("Choice> ")
+                else:
+                    line = input("> ")
             except (EOFError, KeyboardInterrupt):
                 self.running = False
                 return
@@ -3029,17 +3176,18 @@ class GameREPL:
         line = line.strip()
         if not line:
             self.engine.tick_simulation(0.05)
-            self._refresh_display()
+            self._render()
             return
         self._history.append(line)
         self._history_idx = -1
         if self._in_dialogue:
             if self._handle_dialogue_input(line):
                 self.engine.tick_simulation(0.05)
-                self._refresh_display()
+                self._render()
                 return
         self._execute_command(line)
         self.engine.tick_simulation(0.05)
+        # Autosave check.
         if (self.engine.clock.time.tick - self.engine._last_autosave_tick
                 >= self.engine.config.save.autosave_interval_ticks):
             try:
@@ -3047,19 +3195,54 @@ class GameREPL:
                 self.engine._last_autosave_tick = self.engine.clock.time.tick
             except Exception as exc:  # noqa: BLE001
                 log.error("Autosave failed: %s", exc)
-        self._refresh_display()
+        self._render()
 
     def _execute_command(self, line: str) -> None:
         try:
             tokens = shlex.split(line)
         except ValueError as exc:
-            self.print(f"Parse error: {exc}", Color.RED)
+            self.set_output(Text(f"Parse error: {exc}", style="red"),
+                            title="Error")
             return
         if not tokens:
             return
         cmd = tokens[0].lower()
         args = tokens[1:]
-        aliases = {
+        aliases = self._aliases()
+        if cmd in DIRECTIONS:
+            args = [cmd]
+            cmd = "go"
+        else:
+            cmd = aliases.get(cmd, cmd)
+        handler = getattr(self, f"cmd_{cmd}", None)
+        if handler is None:
+            ctx = CommandContext(
+                world=self.engine.world, player=self.engine.player,
+                raw_input=line, engine=self.engine,
+                caller_id=self.engine.player.id if self.engine.player else None,
+                permission=Permission.OWNER if self.engine.cheat_mode else Permission.PLAYER,
+            )
+            result = self.engine.command_processor.execute(line, ctx)
+            if result.output:
+                self.engine.message_log.add(result.output, Color.WHITE)
+            elif result.error:
+                self.engine.message_log.add(result.error, Color.RED)
+            else:
+                self.set_output(
+                    Text(f"Unknown command: {tokens[0]}. Type 'help' for help.",
+                         style="red"),
+                    title="Error",
+                )
+            return
+        try:
+            handler(args)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Command %s failed", cmd)
+            self.set_output(Text(f"Error: {exc}", style="red"), title="Error")
+
+    @staticmethod
+    def _aliases() -> dict[str, str]:
+        return {
             "l": "look", "look": "look",
             "i": "inventory", "inv": "inventory", "inventory": "inventory",
             "c": "character", "char": "character", "character": "character",
@@ -3086,6 +3269,7 @@ class GameREPL:
             "save": "save",
             "load": "load",
             "help": "help", "?": "help", "h": "help",
+            "banner": "banner",
             "plugins": "plugins",
             "quit": "quit", "q": "quit", "exit": "quit",
             "fish": "fish",
@@ -3168,65 +3352,6 @@ class GameREPL:
             "meditate": "meditate",
             "schools": "schools",
         }
-        if cmd in DIRECTIONS:
-            args = [cmd]
-            cmd = "go"
-        else:
-            cmd = aliases.get(cmd, cmd)
-        handler = getattr(self, f"cmd_{cmd}", None)
-        if handler is None:
-            ctx = CommandContext(
-                world=self.engine.world, player=self.engine.player,
-                raw_input=line, engine=self.engine,
-                caller_id=self.engine.player.id if self.engine.player else None,
-                permission=Permission.OWNER if self.engine.cheat_mode else Permission.PLAYER,
-            )
-            result = self.engine.command_processor.execute(line, ctx)
-            if result.output:
-                self.engine.message_log.add(result.output, Color.WHITE)
-            elif result.error:
-                self.engine.message_log.add(result.error, Color.RED)
-            else:
-                self.print(f"Unknown command: {tokens[0]}. Type 'help' for help.",
-                           color=Color.RED)
-            return
-        try:
-            handler(args)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Command %s failed", cmd)
-            self.print(f"Error: {exc}", Color.RED)
-
-    def _refresh_display(self) -> None:
-        if self._color:
-            sys.stdout.write(ANSI.CLEAR_SCREEN)
-        else:
-            sys.stdout.write("\n" * 2)
-        sys.stdout.flush()
-        self._write_main_view()
-        if self._panel_buffer:
-            sys.stdout.write("\n".join(self._panel_buffer) + "\n")
-            self._panel_buffer.clear()
-        if self._in_dialogue:
-            self._show_dialogue_node()
-            if self._panel_buffer:
-                sys.stdout.write("\n".join(self._panel_buffer) + "\n")
-                self._panel_buffer.clear()
-        sys.stdout.flush()
-
-    def _write_main_view(self) -> None:
-        self._panel_buffer.clear()
-        self.show_status_panel()
-        if self._panel_buffer:
-            sys.stdout.write("\n".join(self._panel_buffer) + "\n")
-            self._panel_buffer.clear()
-        self.show_map_view()
-        if self._panel_buffer:
-            sys.stdout.write("\n".join(self._panel_buffer) + "\n")
-            self._panel_buffer.clear()
-        self.show_messages()
-        if self._panel_buffer:
-            sys.stdout.write("\n".join(self._panel_buffer) + "\n")
-            self._panel_buffer.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -3256,19 +3381,53 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Player character name.")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable ANSI colour output.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print engine logs to stderr in addition to the log file.")
     return parser.parse_args(argv)
+
+
+def _configure_quiet_logging(log_file: Optional[Path], verbose: bool) -> None:
+    """Configure logging so the console stays clean for the rich UI.
+
+    By default, engine logs go only to the log file. With --verbose, they
+    also go to stderr.
+    """
+    import logging
+    from engine.core.logging import configure_logging
+    level = logging.DEBUG if verbose else logging.INFO
+    configure_logging(
+        level=logging.WARNING if not verbose else level,
+        log_file=log_file,
+    )
+    # The Engine's __init__ will call configure_logging() again, which would
+    # re-add a console INFO handler. Monkey-patch the module-level
+    # `configure_logging` so subsequent calls from the Engine preserve our
+    # quiet console setting.
+    import engine.core.logging as _elog
+    _orig_configure = _elog.configure_logging
+
+    def _quiet_configure(*args: Any, **kwargs: Any) -> Any:
+        # Force the console level to WARNING unless verbose was requested.
+        if not verbose:
+            kwargs["level"] = logging.WARNING
+        return _orig_configure(*args, **kwargs)
+
+    _elog.configure_logging = _quiet_configure
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Single entry point for Aeon Engine."""
     args = parse_args(argv)
-    # Make sure the project root is on sys.path so `engine` resolves.
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
+    # Configure logging BEFORE any engine imports so get_logger() doesn't
+    # auto-configure at INFO level behind our back. We'll re-apply after
+    # we know the log file path from config.
+    _configure_quiet_logging(None, args.verbose)
+
     from engine.core.config import EngineConfig, load_config, set_config
-    from engine.core.logging import configure_logging
     from engine.engine import Engine
     from engine.world.generator import WorldGenParams
 
@@ -3282,17 +3441,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         config.world.world_seed = args.seed
     set_config(config)
 
-    import logging
-    configure_logging(
-        level=logging.DEBUG if config.debug else logging.INFO,
-        log_file=Path(config.log_file) if config.log_file else None,
-    )
+    # Configure logging: keep console clean unless --verbose.
+    log_file = Path(config.log_file) if config.log_file else None
+    if log_file is not None and not log_file.is_absolute():
+        log_file = project_root / log_file
+    _configure_quiet_logging(log_file, args.verbose)
+
     log.info("Starting Aeon Engine v%s", config.version)
 
-    # The REPL provides its own UI, so we always run the engine headless.
     engine = Engine(config, headless=True)
     if args.no_plugins:
         engine.config.plugins.autoload_enabled = False
+
+    # Re-apply quiet logging in case the Engine's __init__ reset it.
+    _configure_quiet_logging(log_file, args.verbose)
 
     if args.load:
         try:
@@ -3322,7 +3484,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                  engine.player.id if engine.player else None)
         return 0
 
-    # Load plugins.
     if engine.config.plugins.autoload_enabled:
         try:
             success, failure = engine.plugins.load_all()
