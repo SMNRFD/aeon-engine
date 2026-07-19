@@ -116,23 +116,35 @@ class SurvivalSystem:
                             WeatherType.THUNDERSTORM, WeatherType.SNOW,
                             WeatherType.BLIZZARD):
             effective -= 3.0
-        # Entity warmth drifts toward effective temperature
-        delta = effective - needs.warmth
-        # Endurance slows the change
-        rate = 0.05 * (1.0 - min(0.7, stats.endurance / 30.0))
+        # Clothing baseline: assume basic clothing provides ~10°C of
+        # insulation, so a dressed entity's comfort target is `effective +
+        # 10` (capped at normal body temperature 37°C). Without this the
+        # player freezes to death in seconds whenever the weather is below
+        # 25°C, which made HP drop continuously from spawn.
+        clothed_target = min(37.0, effective + 10.0)
+        delta = clothed_target - needs.warmth
+        # Endurance slows the change. The drift rate is now much slower
+        # (0.015/s instead of 0.05/s) so the player has minutes, not
+        # seconds, before exposure becomes dangerous.
+        rate = 0.015 * (1.0 - min(0.7, stats.endurance / 30.0))
         needs.warmth += delta * rate * dt
-        # Damage from extreme warmth
-        if needs.warmth < 25:
+        # When warmth is in the comfort zone (32-42°C) it slowly drifts
+        # back toward 37°C — self-stabilising so idle players don't die.
+        if 32.0 <= needs.warmth <= 42.0:
+            needs.warmth += (37.0 - needs.warmth) * 0.01 * dt
+        # Damage from extreme warmth — only at < 20°C (was 25°C) and the
+        # damage rate is halved.
+        if needs.warmth < 20:
             exposure = ExposureLevel.EXTREME
-            damage = (25 - needs.warmth) * 0.05 * dt
+            damage = (20 - needs.warmth) * 0.025 * dt
             health.current = max(0, int(health.current - damage))
             needs.fatigue += damage * 0.5
-        elif needs.warmth < 32:
+        elif needs.warmth < 30:
             exposure = ExposureLevel.HARSH
-            needs.fatigue += 0.1 * dt
-        elif needs.warmth > 42:
+            needs.fatigue += 0.05 * dt
+        elif needs.warmth > 44:
             exposure = ExposureLevel.HARSH
-            damage = (needs.warmth - 42) * 0.04 * dt
+            damage = (needs.warmth - 44) * 0.02 * dt
             health.current = max(0, int(health.current - damage))
             needs.thirst += damage * 2.0
         else:
