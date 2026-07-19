@@ -65,7 +65,7 @@ from engine.commands.system import (
 )
 from engine.entities.components import (
     AI as AIComp, Combat as CombatComp, Health, Identity, Needs, Position,
-    Stats, Wealth, Race, Personality,
+    Stats, Wealth, Race, Personality, Tag,
 )
 from engine.magic.spells import Mana
 from engine.render.terminal import Color, ANSI
@@ -721,25 +721,38 @@ class GameREPL:
         for ent, (ep,) in self.engine.world.view(Position):
             if ep.x != pos.x or ep.y != pos.y:
                 continue
-            identity = self.engine.world.get_component(ent, Identity)
-            if identity and "item" in identity.tags:
-                # Get item data
-                item_data_id = identity.item_data_id if hasattr(identity, "item_data_id") else None
-                if item_data_id is None:
-                    continue
-                item = self.engine.items.get(item_data_id)
-                if item is None:
-                    continue
-                inv = self.engine.inventories.get(self.engine.player.id)
-                if inv:
-                    inv.add(item, 1)
-                    self.engine.message_log.add(
-                        f"You pick up {item.display_name}.",
-                        Color.GREEN,
-                    )
-                    picked_up = True
-                # Remove the entity
-                self.engine.world.destroy_entity(ent)
+            # Check if entity has the "item" tag
+            if not self.engine.world.has_tag(ent, "item"):
+                continue
+            # Get the item ID from the Tag component
+            tag_comp = self.engine.world.get_component(ent, Tag)
+            if tag_comp is None:
+                continue
+            # Extract item_id from tags like "item:123"
+            item_id = None
+            for t in tag_comp.tags:
+                if t.startswith("item:"):
+                    try:
+                        item_id = int(t.split(":")[1])
+                    except (ValueError, IndexError):
+                        continue
+                    break
+            if item_id is None:
+                continue
+            # Get item data
+            item = self.engine.items.get(item_id)
+            if item is None:
+                continue
+            inv = self.engine.inventories.get(self.engine.player.id)
+            if inv:
+                inv.add(item, 1)
+                self.engine.message_log.add(
+                    f"You pick up {item.display_name}.",
+                    Color.GREEN,
+                )
+                picked_up = True
+            # Remove the entity
+            self.engine.world.destroy_entity(ent)
         if not picked_up:
             self.engine.message_log.add("There's nothing to pick up.", Color.GRAY)
 
