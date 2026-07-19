@@ -67,6 +67,10 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+# stdlib threading for non-blocking input in live mode.
+import threading
+import queue as _queue
+
 
 log = get_logger("repl")
 
@@ -181,6 +185,27 @@ class GameREPL:
 
         # Whether we have a real TTY for input (raw mode).
         self._interactive: bool = self._is_tty()
+
+        # ----- live-dashboard mode state -----
+        # When True, run() uses rich.live.Live to continuously auto-refresh
+        # the layout in real time while a background thread reads input.
+        self.live_mode: bool = False
+        # Target frame rate for live refresh (frames per second).
+        self._live_fps: float = 8.0
+        # Real-time simulation cadence — how often to advance the engine
+        # simulation tick (seconds of wall-clock time between ticks).
+        self._sim_dt: float = 0.25
+        # Time of last simulation tick (for real-time world advancement).
+        self._last_sim_time: float = 0.0
+        # Input queue + reader thread (live mode only).
+        self._input_queue: "_queue.Queue[Optional[str]]" = _queue.Queue()
+        self._input_thread: Optional[threading.Thread] = None
+        # Current input line being typed (for echo in the live layout).
+        self._live_input: str = ""
+        # Last command entered (shown briefly in the input panel).
+        self._last_command: str = ""
+        # Whether the input reader thread should stop.
+        self._input_stop: threading.Event = threading.Event()
 
     # ----- terminal helpers ----------------------------------------------- #
 
@@ -3070,6 +3095,12 @@ class GameREPL:
 
     def run(self) -> None:
         self.running = True
+        # Live-dashboard mode: use rich.live.Live for continuous auto-refresh.
+        # Falls back to the static render loop when stdin isn't a TTY (piped
+        # input, CI) or when live_mode was explicitly disabled.
+        if self.live_mode and self._interactive:
+            self._run_live()
+            return
         # Enable raw mode only when stdin is a real TTY.
         if self._interactive:
             self.enable_raw_mode()
@@ -3094,6 +3125,163 @@ class GameREPL:
                 print()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ----- live-dashboard mode -------------------------------------------- #
+
+    def _build_live_layout(self) -> Layout:
+        """Build the rich Layout used for live-dashboard mode.
+
+        Layout structure (top-to-bottom):
+            - banner      (size 7)  — the Aeon Engine welcome banner
+            - middle      (ratio 2) — status (left) + map (right)
+            - lower       (ratio 2) — messages (left) + command output (right)
+            - input       (size 3)  — prompt + current input line
+        """
+        layout = Layout()
+        layout.split_column(
+            Layout(self._banner_panel(), name="banner", size=7),
+            Layout(name="middle", ratio=2),
+            Layout(name="lower", ratio=2),
+            Layout(name="input", size=3),
+        )
+        # Split middle into status + map.
+        layout["middle"].split_row(
+            Layout(self._status_panel(), name="status"),
+            Layout(self._map_panel(), name="map"),
+        )
+        # Split lower into messages + command output.
+        layout["lower"].split_row(
+            Layout(self._messages_panel(), name="messages"),
+            Layout(self._command_output_panel() or Panel(Text("(no command output yet — try 'help'", style="dim"),
+                                                          title="[bold magenta]Output[/]",
+                                                          border_style="magenta"),
+                    name="output"),
+        )
+        # Input line.
+        layout["input"].update(self._input_panel())
+        return layout
+
+    def _input_panel(self) -> Panel:
+        """The bottom input line — shows the prompt and current input."""
+        prompt = "Choice> " if self._in_dialogue else "> "
+        body = Text()
+        body.append(prompt, style="bold green" if not self._in_dialogue else "bold yellow")
+        body.append(self._live_input, style="white")
+        # Add a blinking cursor block.
+        body.append("_", style="bold white")
+        hint = ""
+        if self._last_command:
+            hint = f"  (last: {self._last_command[:40]})"
+        body.append(hint, style="dim")
+        return Panel(body, title="[bold green]Input[/]  (type 'help' for commands, 'q' to quit)",
+                     border_style="green", expand=True, height=3)
+
+    def _input_reader_loop(self) -> None:
+        """Background thread that reads stdin line-by-line without blocking the UI.
+
+        Pushes each completed line (or None on EOF) onto the input queue.
+        """
+        while not self._input_stop.is_set():
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                self._input_queue.put(None)
+                return
+            self._input_queue.put(line)
+
+    def _run_live(self) -> None:
+        """Run the game in live-dashboard mode with rich.live.Live.
+
+        The Live display auto-refreshes at ``self._live_fps`` frames per
+        second. A background thread reads stdin so the UI never blocks
+        waiting for input. The simulation auto-advances in real time so
+        the world feels alive (NPCs move, weather changes, messages
+        appear) even when the player is idle.
+        """
+        # Start the input reader thread.
+        self._input_stop.clear()
+        self._input_thread = threading.Thread(
+            target=self._input_reader_loop, name="aeon-input", daemon=True,
+        )
+        self._input_thread.start()
+        self._last_sim_time = time.perf_counter()
+        try:
+            with Live(
+                self._build_live_layout(),
+                console=self.console,
+                refresh_per_second=self._live_fps,
+                screen=True,  # alternate screen buffer — full-screen takeover
+                transient=False,
+            ) as live:
+                while self.running:
+                    # 1. Drain any completed input lines (non-blocking).
+                    try:
+                        while True:
+                            line = self._input_queue.get_nowait()
+                            if line is None:
+                                self.running = False
+                                break
+                            self._handle_live_input(line)
+                            if not self.running:
+                                break
+                    except _queue.Empty:
+                        pass
+                    if not self.running:
+                        break
+                    # 2. Advance the simulation in real time.
+                    now = time.perf_counter()
+                    if now - self._last_sim_time >= self._sim_dt:
+                        try:
+                            self.engine.tick_simulation(self._sim_dt)
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("Simulation tick failed")
+                            self.set_output(Text(f"Sim error: {exc}", style="red"),
+                                            title="Error")
+                        # Autosave check.
+                        if (self.engine.clock.time.tick - self.engine._last_autosave_tick
+                                >= self.engine.config.save.autosave_interval_ticks):
+                            try:
+                                self.engine.save_game("autosave")
+                                self.engine._last_autosave_tick = self.engine.clock.time.tick
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("Autosave failed: %s", exc)
+                        self._last_sim_time = now
+                    # 3. Update the live display with a fresh layout.
+                    live.update(self._build_live_layout())
+                    # 4. Sleep roughly one frame.
+                    time.sleep(1.0 / self._live_fps)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._input_stop.set()
+            # Wake the input thread if it's blocked on input().
+            try:
+                # Closing stdin makes input() raise EOFError in the reader.
+                # We can't safely close sys.stdin here (the shell needs it),
+                # so we just rely on the daemon thread dying with the process.
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_live_input(self, line: str) -> None:
+        """Process a completed input line in live mode."""
+        line = line.strip()
+        self._live_input = ""
+        if not line:
+            return
+        self._last_command = line
+        self._history.append(line)
+        self._history_idx = -1
+        # Dialogue takes precedence.
+        if self._in_dialogue:
+            if self._handle_dialogue_input(line):
+                return
+        # Otherwise execute as a command.
+        try:
+            self._execute_command(line)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Live command %s failed", line)
+            self.set_output(Text(f"Error: {exc}", style="red"), title="Error")
 
     def _tick(self) -> None:
         # Read input.
@@ -3383,6 +3571,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Disable ANSI colour output.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print engine logs to stderr in addition to the log file.")
+    parser.add_argument("--live", action="store_true", default=True,
+                        help="Use the live-dashboard UI (rich.live.Live) — default.")
+    parser.add_argument("--no-live", action="store_false", dest="live",
+                        help="Disable live-dashboard mode; use the static render loop instead.")
+    parser.add_argument("--fps", type=float, default=8.0,
+                        help="Live-mode refresh rate in frames per second (default 8).")
+    parser.add_argument("--sim-rate", type=float, default=0.25,
+                        help="Live-mode simulation tick interval in seconds (default 0.25).")
     return parser.parse_args(argv)
 
 
@@ -3495,6 +3691,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         repl = GameREPL(engine)
+        # Configure live-dashboard mode. Live mode auto-disables when stdin
+        # isn't a TTY (piped input, CI) because rich.live.Live with
+        # screen=True would corrupt non-interactive output.
+        if args.live and repl._is_tty():
+            repl.live_mode = True
+            repl._live_fps = max(1.0, min(30.0, args.fps))
+            repl._sim_dt = max(0.05, min(5.0, args.sim_rate))
+        else:
+            repl.live_mode = False
         repl.run()
     except KeyboardInterrupt:
         log.info("Interrupted by user")
