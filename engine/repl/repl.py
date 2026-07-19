@@ -206,6 +206,18 @@ class GameREPL:
         self._live_input: str = ""
         # Last command entered (shown briefly in the input panel hint).
         self._last_command: str = ""
+        # ----- output panel scroll state -----
+        # Vertical scroll offset (in lines) for the command-output panel.
+        # 0 = bottom (most recent). Positive = scrolled up.
+        self._output_scroll: int = 0
+        # Rendered lines of the current command output (cached each frame
+        # so the scroll logic knows how many lines there are).
+        self._output_line_count: int = 0
+        # ----- game-over state -----
+        # When True, the hero is dead and the game shows a game-over panel
+        # instead of the normal layout. The player can press R to respawn,
+        # N to start a new game, or Q to quit.
+        self._game_over: bool = False
 
     # ----- terminal helpers ----------------------------------------------- #
 
@@ -1373,7 +1385,7 @@ class GameREPL:
             ("Dimensions", "dimensions; portal <from> <to>; travel <dim>"),
             ("Body Parts", "bodyparts; heal_part <part> [amount]"),
             ("System", "save [name]; load <name>; plugins; help (?); banner; respawn; "
-                         "memory [npc]; schedule; Quit (q)"),
+                         "new_game; memory [npc]; schedule; Quit (q)"),
         ]
         for cat, lines in categories:
             table.add_row(cat, lines)
@@ -1646,29 +1658,21 @@ class GameREPL:
         self.engine.shutdown()
 
     def cmd_respawn(self, args: list[str]) -> None:
-        """Manually respawn (useful if the player gets stuck)."""
+        """Manually respawn (useful if the player gets stuck or dies)."""
         if self.engine.player is None:
             return
-        from engine.entities.components import Health as HealthComp, Needs as NeedsComp
-        health = self.engine.world.get_component(self.engine.player, HealthComp)
-        if health:
-            health.current = health.maximum
-        needs = self.engine.world.get_component(self.engine.player, NeedsComp)
-        if needs:
-            needs.hunger = 0.0
-            needs.thirst = 0.0
-            needs.fatigue = 0.0
-            needs.sleep = 0.0
-            needs.warmth = 37.0
-        if self.engine.world_map is not None:
-            pos = self.engine.world.get_component(self.engine.player, Position)
-            if pos:
-                pos.x = self.engine.world_map.spawn_point.x
-                pos.y = self.engine.world_map.spawn_point.y
-                self.engine.spatial.update(self.engine.player, pos.x, pos.y)
-        self.engine._update_visibility()
-        self.msg("You have been restored to full health at the spawn point.",
-                 Color.GREEN)
+        self.engine.respawn_player()
+        self._game_over = False
+        self.set_output(Text("You have been restored to full health at the spawn point.",
+                             style="green"), title="Respawned")
+
+    def cmd_new_game(self, args: list[str]) -> None:
+        """Start a brand new game with a fresh world."""
+        name = args[0] if args else "Hero"
+        self.engine.new_game(name)
+        self._game_over = False
+        self.set_output(Text("A new world has been generated. Your adventure begins anew.",
+                             style="cyan"), title="New Game")
 
     def cmd_memory(self, args: list[str]) -> None:
         """Show an NPC's memories (integrates the NPC memory system)."""
@@ -3207,7 +3211,16 @@ class GameREPL:
             - middle      (ratio 2) — status (left) + map (right)
             - lower       (ratio 2) — messages (left) + command output (right)
             - input       (size 3)  — prompt + current input line
+
+        When the player is dead (``_game_over`` is True), the layout is
+        replaced with a full-screen game-over panel.
         """
+        # Game-over screen takes over the whole layout.
+        if self._game_over:
+            layout = Layout()
+            layout.update(self._game_over_panel())
+            return layout
+
         layout = Layout()
         layout.split_column(
             Layout(self._banner_panel(), name="banner", size=7),
@@ -3220,17 +3233,101 @@ class GameREPL:
             Layout(self._status_panel(), name="status"),
             Layout(self._map_panel(), name="map"),
         )
-        # Split lower into messages + command output.
+        # Split lower into messages + command output (with scrollbar).
         layout["lower"].split_row(
             Layout(self._messages_panel(), name="messages"),
-            Layout(self._command_output_panel() or Panel(Text("(no command output yet — try 'help'", style="dim"),
-                                                          title="[bold magenta]Output[/]",
-                                                          border_style="magenta"),
-                    name="output"),
+            Layout(self._scrollable_output_panel(), name="output"),
         )
         # Input line.
         layout["input"].update(self._input_panel())
         return layout
+
+    def _game_over_panel(self) -> Panel:
+        """Full-screen game-over panel shown when the hero dies."""
+        from engine.entities.components import Identity
+        identity = (self.engine.world.get_component(self.engine.player, Identity)
+                    if self.engine.player else None)
+        name = identity.display_name if identity else "Hero"
+        body = Text()
+        body.append("\n")
+        body.append("╔══════════════════════════════════════════════════════════╗\n",
+                    style="bold red")
+        body.append("║                                                          ║\n",
+                    style="bold red")
+        body.append("║                    G A M E   O V E R                     ║\n",
+                    style="bold red")
+        body.append("║                                                          ║\n",
+                    style="bold red")
+        body.append("╚══════════════════════════════════════════════════════════╝\n",
+                    style="bold red")
+        body.append("\n")
+        body.append(f"  {name} has fallen.\n\n", style="bold white")
+        body.append("  Choose your fate:\n\n", style="yellow")
+        body.append("    [R]  ", style="bold green")
+        body.append("Respawn at spawn point (lose half of carried wealth)\n", style="white")
+        body.append("    [N]  ", style="bold cyan")
+        body.append("Start a new game (new world, new character)\n", style="white")
+        body.append("    [Q]  ", style="bold red")
+        body.append("Quit the game\n", style="white")
+        body.append("\n  Press a key to continue...\n", style="dim")
+        return Panel(body, title="[bold red]Game Over[/]", border_style="red",
+                     expand=True)
+
+    def _scrollable_output_panel(self) -> Panel:
+        """Command-output panel with scrollbar and vertical scrolling.
+
+        The output renderable is rendered to a plain-text string, then
+        split into lines. We apply the current scroll offset (lines from
+        the bottom) and show a scrollbar on the right edge so the player
+        can tell where they are in a long listing.
+        """
+        from io import StringIO
+        renderable = self._command_output_panel()
+        if renderable is None:
+            self._output_line_count = 0
+            return Panel(Text("(no command output yet — try 'help')", style="dim"),
+                         title="[bold magenta]Output[/]",
+                         border_style="magenta", expand=True)
+        # Render the inner renderable to plain text to count lines.
+        try:
+            buf = StringIO()
+            tmp = Console(file=buf, force_terminal=False, color_system=None,
+                          highlight=False, soft_wrap=True, width=60)
+            tmp.print(renderable.renderable if hasattr(renderable, "renderable") else renderable)
+            all_lines = buf.getvalue().splitlines()
+        except Exception:  # noqa: BLE001
+            all_lines = [str(renderable)]
+        self._output_line_count = len(all_lines)
+        # Determine the visible window. The panel height is roughly
+        # determined by the layout ratio; assume ~15 lines visible.
+        visible_h = 15
+        total = len(all_lines)
+        if total <= visible_h:
+            # Everything fits — no scroll needed.
+            self._output_scroll = 0
+            content = Text("\n".join(all_lines))
+        else:
+            # Clamp scroll offset.
+            max_scroll = total - visible_h
+            if self._output_scroll < 0:
+                self._output_scroll = 0
+            if self._output_scroll > max_scroll:
+                self._output_scroll = max_scroll
+            # Window: bottom-anchored. scroll=0 shows the last `visible_h`
+            # lines. scroll=N shows lines [total-visible_h-N : total-N].
+            start = max(0, total - visible_h - self._output_scroll)
+            end = start + visible_h
+            visible_lines = all_lines[start:end]
+            content = Text("\n".join(visible_lines))
+        # Build a scrollbar indicator for the title.
+        if self._output_line_count > visible_h:
+            scroll_pct = (self._output_scroll / max(1, self._output_line_count - visible_h))
+            title = (f"[bold magenta]Output[/]  "
+                     f"[dim]{self._output_line_count} lines  "
+                     f"↑↓ scroll  ({int(scroll_pct * 100)}%)[/]")
+        else:
+            title = "[bold magenta]Output[/]"
+        return Panel(content, title=title, border_style="magenta", expand=True)
 
     def _input_panel(self) -> Panel:
         """The bottom input line — shows the prompt and current input."""
@@ -3285,7 +3382,15 @@ class GameREPL:
             self._read_live_input_unix()
 
     def _read_live_input_unix(self) -> None:
-        """Non-blocking stdin reader for Unix (Linux/macOS)."""
+        """Non-blocking stdin reader for Unix (Linux/macOS).
+
+        Handles:
+        - Game-over keys (R/N/Q) when ``_game_over`` is True
+        - Arrow Up/Down to scroll the output panel
+        - Enter to commit the input line
+        - Backspace, Ctrl-C, Ctrl-D
+        - Printable chars appended to ``_live_input``
+        """
         import select as _select
         import os as _os
         try:
@@ -3308,6 +3413,12 @@ class GameREPL:
             if not ch:
                 self._input_queue.put(None)
                 return
+            # Game-over mode: only accept R, N, Q.
+            if self._game_over:
+                key = ch.upper()
+                if key in ("R", "N", "Q"):
+                    self._input_queue.put(f"__gameover_{key}__")
+                continue
             # Map special chars.
             if ch in ("\r", "\n"):
                 line = self._live_input
@@ -3325,7 +3436,7 @@ class GameREPL:
                 self._input_queue.put(None)
                 return
             if ch == "\x1b":
-                # Escape sequence — consume the rest (non-blocking).
+                # Escape sequence — parse arrow keys for scrolling.
                 try:
                     r2, _, _ = _select.select([fd], [], [], 0.01)
                     if r2:
@@ -3333,24 +3444,34 @@ class GameREPL:
                         if ch2 in ("[", "O"):
                             r3, _, _ = _select.select([fd], [], [], 0.01)
                             if r3:
-                                _os.read(fd, 1)
+                                ch3 = _os.read(fd, 1).decode("utf-8", errors="replace")
+                                if ch3 == "A":  # Up arrow
+                                    self._output_scroll += 3
+                                elif ch3 == "B":  # Down arrow
+                                    self._output_scroll -= 3
+                                    if self._output_scroll < 0:
+                                        self._output_scroll = 0
+                                # Left/Right (C/D) ignored for now.
+                                continue
                 except OSError:
                     pass
                 continue
             if ch == "\t":
                 continue
+            # Any new typing resets the scroll to bottom.
             if ch.isprintable():
+                self._output_scroll = 0
                 self._live_input += ch
 
     def _read_live_input_windows(self) -> None:
         """Non-blocking stdin reader for Windows using ``msvcrt``.
 
-        ``msvcrt.getch`` returns a bytes object of length 1 for ordinary
-        keys, or the special prefix ``b'\\x00'`` / ``b'\\xe0'`` for
-        extended keys (arrows, function keys) followed by a second
-        ``getch`` call for the key code. We only care about printable
-        chars, Enter, Backspace, Ctrl-C, and Ctrl-D; everything else is
-        discarded.
+        Handles:
+        - Game-over keys (R/N/Q) when ``_game_over`` is True
+        - Arrow Up/Down to scroll the output panel (via extended keys)
+        - Enter to commit the input line
+        - Backspace, Ctrl-C, Ctrl-D
+        - Printable chars appended to ``_live_input``
         """
         import msvcrt  # type: ignore[import-not-found]
         # Drain all available keystrokes without blocking.
@@ -3364,15 +3485,30 @@ class GameREPL:
                 return
             if not ch_bytes:
                 return
-            # Extended key prefix — read and discard the second byte.
+            # Extended key prefix — read the second byte for arrow keys.
             if ch_bytes in (b"\x00", b"\xe0"):
                 try:
-                    msvcrt.getch()
+                    ext = msvcrt.getch()
                 except OSError:
-                    pass
+                    ext = b""
+                # Windows arrow key codes: H=up, P=down, K=left, M=right
+                if ext == b"H":  # Up arrow
+                    if not self._game_over:
+                        self._output_scroll += 3
+                elif ext == b"P":  # Down arrow
+                    if not self._game_over:
+                        self._output_scroll -= 3
+                        if self._output_scroll < 0:
+                            self._output_scroll = 0
                 continue
             ch = ch_bytes.decode("latin-1", errors="replace")
             if not ch:
+                continue
+            # Game-over mode: only accept R, N, Q.
+            if self._game_over:
+                key = ch.upper()
+                if key in ("R", "N", "Q"):
+                    self._input_queue.put(f"__gameover_{key}__")
                 continue
             # Map special chars.
             if ch in ("\r", "\n"):
@@ -3394,7 +3530,9 @@ class GameREPL:
                 continue
             if ch == "\t":
                 continue
+            # Any new typing resets the scroll to bottom.
             if ch.isprintable():
+                self._output_scroll = 0
                 self._live_input += ch
 
     def _run_live(self) -> None:
@@ -3464,24 +3602,30 @@ class GameREPL:
                         pass
                     if not self.running:
                         break
-                    # 3. Advance the simulation in real time.
-                    now = time.perf_counter()
-                    if now - self._last_sim_time >= self._sim_dt:
-                        try:
-                            self.engine.tick_simulation(self._sim_dt)
-                        except Exception as exc:  # noqa: BLE001
-                            log.exception("Simulation tick failed")
-                            self.set_output(Text(f"Sim error: {exc}", style="red"),
-                                            title="Error")
-                        # Autosave check.
-                        if (self.engine.clock.time.tick - self.engine._last_autosave_tick
-                                >= self.engine.config.save.autosave_interval_ticks):
+                    # 2b. Detect player death — switch to game-over screen.
+                    if getattr(self.engine, "player_dead", False) and not self._game_over:
+                        self._game_over = True
+                    # 3. Advance the simulation in real time — but pause
+                    #    when the player is dead (the world waits for the
+                    #    player to choose respawn / new game / quit).
+                    if not self._game_over:
+                        now = time.perf_counter()
+                        if now - self._last_sim_time >= self._sim_dt:
                             try:
-                                self.engine.save_game("autosave")
-                                self.engine._last_autosave_tick = self.engine.clock.time.tick
+                                self.engine.tick_simulation(self._sim_dt)
                             except Exception as exc:  # noqa: BLE001
-                                log.error("Autosave failed: %s", exc)
-                        self._last_sim_time = now
+                                log.exception("Simulation tick failed")
+                                self.set_output(Text(f"Sim error: {exc}", style="red"),
+                                                title="Error")
+                            # Autosave check.
+                            if (self.engine.clock.time.tick - self.engine._last_autosave_tick
+                                    >= self.engine.config.save.autosave_interval_ticks):
+                                try:
+                                    self.engine.save_game("autosave")
+                                    self.engine._last_autosave_tick = self.engine.clock.time.tick
+                                except Exception as exc:  # noqa: BLE001
+                                    log.error("Autosave failed: %s", exc)
+                            self._last_sim_time = now
                     # 4. Update the live display with a fresh layout.
                     live.update(self._build_live_layout())
                     # 5. Sleep roughly one frame.
@@ -3499,9 +3643,29 @@ class GameREPL:
 
     def _handle_live_input(self, line: str) -> None:
         """Process a completed input line in live mode."""
-        line = line.strip()
+        line = line.strip() if line else ""
         self._live_input = ""
+        # Game-over key handling (R/N/Q).
+        if line == "__gameover_R__":
+            self._game_over = False
+            self.engine.respawn_player()
+            self.set_output(Text("You have been restored to full health at the spawn point.",
+                                 style="green"), title="Respawned")
+            return
+        if line == "__gameover_N__":
+            self._game_over = False
+            self.engine.new_game("Hero")
+            self.set_output(Text("A new world has been generated. Your adventure begins anew.",
+                                 style="cyan"), title="New Game")
+            return
+        if line == "__gameover_Q__":
+            self.running = False
+            self.engine.shutdown()
+            return
         if not line:
+            return
+        # If the player is dead, ignore all other input.
+        if self._game_over:
             return
         self._last_command = line
         self._history.append(line)
@@ -3696,6 +3860,7 @@ class GameREPL:
             "plugins": "plugins",
             "quit": "quit", "q": "quit", "exit": "quit",
             "respawn": "respawn",
+            "new_game": "new_game", "newgame": "new_game", "new": "new_game",
             "memory": "memory", "mem": "memory",
             "schedule": "schedule", "sched": "schedule",
             "fish": "fish",

@@ -172,6 +172,9 @@ class Engine:
         self.current_input: str = ""
         self.cheat_mode: bool = self.config.debug
         self._running = False
+        # When True, the player is dead and the simulation pauses for the
+        # player until respawn_player() or new_game() is called.
+        self.player_dead: bool = False
         self._last_tick_time: float = 0.0
         self._last_autosave_tick: int = 0
 
@@ -430,49 +433,100 @@ class Engine:
     def _check_player_death(self) -> None:
         """Handle the player reaching 0 HP.
 
-        Previously the player would just sit at 0 HP forever. Now we
-        respawn them at full health with a small XP/gold penalty and
-        teleport them back to the world spawn point, and emit a message
-        so the REPL can surface it.
+        Sets the ``player_dead`` flag so the REPL can show a game-over
+        panel. The simulation pauses for the player (other entities keep
+        simulating) until the REPL calls ``respawn_player()`` or
+        ``new_game()``.
         """
-        if self.player is None or self.world_map is None:
+        if self.player is None:
             return
-        from engine.entities.components import Health as HealthComp, Position as PosComp, Identity
+        from engine.entities.components import Health as HealthComp, Identity
         health = self.world.get_component(self.player, HealthComp)
         if health is None or health.current > 0:
             return
-        # Player is dead — respawn.
+        if getattr(self, "player_dead", False):
+            return  # already dead — don't re-trigger
+        # Mark the player as dead.
+        self.player_dead = True
         identity = self.world.get_component(self.player, Identity)
         name = identity.display_name if identity else "Hero"
-        # Reset HP and needs.
-        health.current = health.maximum
-        from engine.entities.components import Needs as NeedsComp
+        self.message_log.add(f"{name} has been slain! Game over.", Color.RED)
+        self.message_log.add("  Press R to respawn, N for a new game, Q to quit.",
+                             Color.YELLOW)
+
+    def respawn_player(self) -> None:
+        """Respawn the dead player at the spawn point with full HP.
+
+        Called by the REPL when the player presses R on the game-over
+        screen. Applies a wealth penalty (lose half of carried copper)
+        and resets needs, but keeps the same world and character.
+        """
+        if self.player is None or self.world_map is None:
+            return
+        from engine.entities.components import (
+            Health as HealthComp, Needs as NeedsComp, Position as PosComp,
+            Wealth, Identity,
+        )
+        health = self.world.get_component(self.player, HealthComp)
+        if health:
+            health.current = health.maximum
         needs = self.world.get_component(self.player, NeedsComp)
         if needs:
             needs.hunger = 0.0
             needs.thirst = 0.0
-            needs.fatigue = 50.0  # waking up tired
+            needs.fatigue = 50.0
             needs.sleep = 50.0
             needs.warmth = 37.0
-        # Teleport to spawn point.
         pos = self.world.get_component(self.player, PosComp)
         if pos:
             pos.x = self.world_map.spawn_point.x
             pos.y = self.world_map.spawn_point.y
             self.spatial.update(self.player, pos.x, pos.y)
-        # Gold penalty (lose half of carried copper).
-        from engine.entities.components import Wealth
         wealth = self.world.get_component(self.player, Wealth)
         if wealth:
             wealth.copper = wealth.copper // 2
             wealth.silver = wealth.silver // 2
             wealth.gold = wealth.gold // 2
-        # Update visibility around new position.
         self._update_visibility()
-        # Surface to the player.
-        self.message_log.add(f"{name} was slain! You awaken at the spawn point, weakened.",
-                             Color.RED)
-        self.message_log.add("  (Lost half your carried wealth.)", Color.YELLOW)
+        self.player_dead = False
+        identity = self.world.get_component(self.player, Identity)
+        name = identity.display_name if identity else "Hero"
+        self.message_log.add(f"{name} awakens at the spawn point, weakened.", Color.GREEN)
+        self.message_log.add("  (Lost half of carried wealth.)", Color.YELLOW)
+
+    def new_game(self, name: str = "Hero") -> None:
+        """Start a brand new game — regenerate the world and player.
+
+        Called by the REPL when the player presses N on the game-over
+        screen. Discards the current world and generates a fresh one.
+        """
+        # Reset the world and all derived state.
+        self.world = World()
+        # Re-wire the entity factory to use the new world.
+        self.factory = EntityFactory(self.world, self.rng)
+        # Clear the spatial grid.
+        from engine.world.spatial import SpatialGrid
+        self.spatial = SpatialGrid(cell_size=8)
+        # Clear inventories, items, and quest trackers.
+        self.inventories = {}
+        self.items = ItemRegistry()
+        self.item_generator = ItemGenerator(self.rng)
+        self.quest_trackers = {}
+        self.player = None
+        self.player_dead = False
+        # Clear the message log.
+        if self.message_log:
+            self.message_log.messages.clear()
+        # Generate a fresh world with a new seed.
+        from engine.world.generator import WorldGenParams
+        params = WorldGenParams(
+            seed=self.rng.randint(1, 999999),
+            width=self.config.world.world_tiles_x // 2,
+            height=self.config.world.world_tiles_y // 2,
+        )
+        self.generate_world(params)
+        self.create_player(name)
+        self.message_log.add("A new world awaits...", Color.CYAN)
 
     def _update_schedules(self) -> None:
         """Drive NPCs toward their daily routine locations.
