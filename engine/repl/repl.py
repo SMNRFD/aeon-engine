@@ -188,7 +188,9 @@ class GameREPL:
 
         # ----- live-dashboard mode state -----
         # When True, run() uses rich.live.Live to continuously auto-refresh
-        # the layout in real time while a background thread reads input.
+        # the layout in real time. Input is read non-blocking on the main
+        # thread (single-threaded design — no race with Live's terminal
+        # state manipulation).
         self.live_mode: bool = False
         # Target frame rate for live refresh (frames per second).
         self._live_fps: float = 8.0
@@ -197,15 +199,13 @@ class GameREPL:
         self._sim_dt: float = 0.25
         # Time of last simulation tick (for real-time world advancement).
         self._last_sim_time: float = 0.0
-        # Input queue + reader thread (live mode only).
+        # Input queue — completed command lines from the non-blocking
+        # reader are pushed here and drained by the main loop.
         self._input_queue: "_queue.Queue[Optional[str]]" = _queue.Queue()
-        self._input_thread: Optional[threading.Thread] = None
-        # Current input line being typed (for echo in the live layout).
+        # Current input line being typed (echoed in the live input panel).
         self._live_input: str = ""
-        # Last command entered (shown briefly in the input panel).
+        # Last command entered (shown briefly in the input panel hint).
         self._last_command: str = ""
-        # Whether the input reader thread should stop.
-        self._input_stop: threading.Event = threading.Event()
 
     # ----- terminal helpers ----------------------------------------------- #
 
@@ -3248,106 +3248,114 @@ class GameREPL:
                      border_style="green", expand=True, height=3)
 
     def _input_reader_loop(self) -> None:
-        """Background thread that reads stdin character-by-character in raw
-        mode, so typed text appears in the input panel immediately (not
-        echoed by the terminal cooked-mode handler, which would write
-        directly to the screen and overwrite the live layout).
+        """Background thread input reader — DEPRECATED.
 
-        Completed lines (on Enter) are pushed onto the input queue. This
-        is the fix for the "input is not working / text overcomes the UI"
-        bug — we take over terminal echo ourselves and render the typed
-        text inside the input panel via ``self._live_input``.
+        Kept for backwards compatibility but no longer used by
+        ``_run_live``. The single-threaded non-blocking reader in
+        ``_run_live`` replaced this because the threaded version raced
+        with ``Live``'s terminal state manipulation, causing input to
+        not register reliably.
         """
-        import termios
-        import tty
-        # Save the terminal state and switch to raw, no-echo mode so the
-        # terminal doesn't echo typed chars (which would clobber the live
-        # layout). We restore on exit.
+        # No-op — the single-threaded loop in _run_live handles input now.
+        return
+
+    def _read_live_input_nonblocking(self) -> None:
+        """Read any pending stdin input without blocking.
+
+        Uses ``select`` to poll stdin for available bytes. For each byte:
+        - Enter (\\r / \\n) commits the current ``_live_input`` as a
+          completed command and pushes it onto the input queue.
+        - Backspace deletes the last char of ``_live_input``.
+        - Ctrl-C / Ctrl-D signals quit.
+        - Escape sequences (arrows etc.) are consumed and discarded.
+        - Printable chars are appended to ``_live_input``.
+
+        This runs on the MAIN thread (not a background thread) so there's
+        no race with ``Live``'s terminal state. The terminal is in raw
+        no-echo mode for the duration of ``_run_live``, so the terminal
+        itself doesn't echo typed chars (which would clobber the layout).
+        """
+        import select as _select
+        import os as _os
         try:
             fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-        except Exception:  # noqa: BLE001 — not a TTY
-            old_settings = None
-        if old_settings is not None:
+        except Exception:  # noqa: BLE001
+            return
+        # Drain all available bytes (up to 256) without blocking.
+        deadline = time.perf_counter() + 0.05  # max 50ms per drain
+        while time.perf_counter() < deadline:
             try:
-                tty.setraw(fd)
-                # Disable terminal echo explicitly (raw mode usually does
-                # this, but be defensive).
-                new = termios.tcgetattr(fd)
-                new[3] = new[3] & ~termios.ECHO  # lflags &= ~ECHO
-                termios.tcsetattr(fd, termios.TCSANOW, new)
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            while not self._input_stop.is_set():
+                r, _, _ = _select.select([fd], [], [], 0.0)
+            except (OSError, ValueError):
+                return
+            if not r:
+                return  # no data available right now
+            try:
+                ch = _os.read(fd, 1).decode("utf-8", errors="replace")
+            except (OSError, UnicodeDecodeError):
+                return
+            if not ch:
+                self._input_queue.put(None)
+                return
+            # Map special chars.
+            if ch in ("\r", "\n"):
+                line = self._live_input
+                self._live_input = ""
+                self._input_queue.put(line)
+                continue
+            if ch in ("\x7f", "\x08"):
+                if self._live_input:
+                    self._live_input = self._live_input[:-1]
+                continue
+            if ch == "\x03":  # Ctrl-C
+                self._input_queue.put(None)
+                return
+            if ch == "\x04":  # Ctrl-D
+                self._input_queue.put(None)
+                return
+            if ch == "\x1b":
+                # Escape sequence — consume the rest (non-blocking).
                 try:
-                    ch = sys.stdin.read(1)
-                except (EOFError, KeyboardInterrupt, OSError):
-                    self._input_queue.put(None)
-                    return
-                if not ch:
-                    self._input_queue.put(None)
-                    return
-                # Map special chars to event keys.
-                if ch in ("\r", "\n"):
-                    # Enter: commit the current line.
-                    line = self._live_input
-                    self._live_input = ""
-                    self._input_queue.put(line)
-                    continue
-                if ch in ("\x7f", "\x08"):
-                    # Backspace.
-                    if self._live_input:
-                        self._live_input = self._live_input[:-1]
-                    continue
-                if ch == "\x03":  # Ctrl-C
-                    self._input_queue.put(None)
-                    return
-                if ch == "\x04":  # Ctrl-D
-                    self._input_queue.put(None)
-                    return
-                if ch == "\x1b":
-                    # Escape sequence (arrows etc.) — read the rest and
-                    # discard (we don't support history navigation in live
-                    # mode yet, but we don't want the escape bytes leaking
-                    # into _live_input either).
-                    try:
-                        ch2 = sys.stdin.read(1)
-                        if ch2 == "[":
-                            sys.stdin.read(1)  # consume the final byte
-                        elif ch2 == "O":
-                            sys.stdin.read(1)
-                    except (EOFError, OSError):
-                        pass
-                    continue
-                if ch == "\t":
-                    continue  # ignore tab for now
-                # Printable char — append to the live input buffer.
-                if ch.isprintable():
-                    self._live_input += ch
-        finally:
-            # Restore terminal state.
-            if old_settings is not None:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except Exception:  # noqa: BLE001
+                    r2, _, _ = _select.select([fd], [], [], 0.01)
+                    if r2:
+                        ch2 = _os.read(fd, 1).decode("utf-8", errors="replace")
+                        if ch2 in ("[", "O"):
+                            r3, _, _ = _select.select([fd], [], [], 0.01)
+                            if r3:
+                                _os.read(fd, 1)
+                except OSError:
                     pass
+                continue
+            if ch == "\t":
+                continue
+            if ch.isprintable():
+                self._live_input += ch
 
     def _run_live(self) -> None:
         """Run the game in live-dashboard mode with rich.live.Live.
 
-        The Live display auto-refreshes at ``self._live_fps`` frames per
-        second. A background thread reads stdin so the UI never blocks
-        waiting for input. The simulation auto-advances in real time so
-        the world feels alive (NPCs move, weather changes, messages
-        appear) even when the player is idle.
+        SINGLE-THREADED, NON-BLOCKING INPUT design:
+        The terminal is switched to raw no-echo mode once at startup.
+        Each animation frame, after updating the Live display, we poll
+        stdin with ``select`` (zero-timeout = non-blocking) and drain
+        any pending characters. This avoids the race condition that
+        plagued the threaded version, where the input thread's
+        ``tty.setraw`` fought with ``Live``'s own terminal manipulation.
         """
-        # Start the input reader thread.
-        self._input_stop.clear()
-        self._input_thread = threading.Thread(
-            target=self._input_reader_loop, name="aeon-input", daemon=True,
-        )
-        self._input_thread.start()
+        import termios
+        import tty
+        # Switch stdin to raw, no-echo mode for the duration of live mode.
+        try:
+            fd = sys.stdin.fileno()
+            old_term_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            new = termios.tcgetattr(fd)
+            new[3] = new[3] & ~termios.ECHO  # lflags &= ~ECHO
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+        except Exception:  # noqa: BLE001 — not a TTY
+            old_term_settings = None
+            fd = None
+
         self._last_sim_time = time.perf_counter()
         try:
             with Live(
@@ -3358,7 +3366,10 @@ class GameREPL:
                 transient=False,
             ) as live:
                 while self.running:
-                    # 1. Drain any completed input lines (non-blocking).
+                    # 1. Read any pending input (non-blocking, main thread).
+                    if fd is not None:
+                        self._read_live_input_nonblocking()
+                    # 2. Drain completed command lines from the queue.
                     try:
                         while True:
                             line = self._input_queue.get_nowait()
@@ -3372,7 +3383,7 @@ class GameREPL:
                         pass
                     if not self.running:
                         break
-                    # 2. Advance the simulation in real time.
+                    # 3. Advance the simulation in real time.
                     now = time.perf_counter()
                     if now - self._last_sim_time >= self._sim_dt:
                         try:
@@ -3390,22 +3401,19 @@ class GameREPL:
                             except Exception as exc:  # noqa: BLE001
                                 log.error("Autosave failed: %s", exc)
                         self._last_sim_time = now
-                    # 3. Update the live display with a fresh layout.
+                    # 4. Update the live display with a fresh layout.
                     live.update(self._build_live_layout())
-                    # 4. Sleep roughly one frame.
+                    # 5. Sleep roughly one frame.
                     time.sleep(1.0 / self._live_fps)
         except KeyboardInterrupt:
             pass
         finally:
-            self._input_stop.set()
-            # Wake the input thread if it's blocked on input().
-            try:
-                # Closing stdin makes input() raise EOFError in the reader.
-                # We can't safely close sys.stdin here (the shell needs it),
-                # so we just rely on the daemon thread dying with the process.
-                pass
-            except Exception:  # noqa: BLE001
-                pass
+            # Restore terminal state.
+            if old_term_settings is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_term_settings)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _handle_live_input(self, line: str) -> None:
         """Process a completed input line in live mode."""
@@ -3416,6 +3424,7 @@ class GameREPL:
         self._last_command = line
         self._history.append(line)
         self._history_idx = -1
+        log.debug("Live input received: %r", line)
         # Dialogue takes precedence.
         if self._in_dialogue:
             if self._handle_dialogue_input(line):
