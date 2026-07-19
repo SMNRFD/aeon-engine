@@ -709,6 +709,117 @@ class GameREPL:
                 return
         self.print(f"You don't have any '{item_name}'.", Color.RED)
 
+    def cmd_pickup(self, args: list[str]) -> None:
+        """Pick up items from the ground."""
+        if self.engine.player is None:
+            return
+        pos = self.engine.world.get_component(self.engine.player, Position)
+        if pos is None:
+            return
+        # Find items at player position
+        picked_up = False
+        for ent, (ep,) in self.engine.world.view(Position):
+            if ep.x != pos.x or ep.y != pos.y:
+                continue
+            identity = self.engine.world.get_component(ent, Identity)
+            if identity and "item" in identity.tags:
+                # Get item data
+                item_data_id = identity.item_data_id if hasattr(identity, "item_data_id") else None
+                if item_data_id is None:
+                    continue
+                item = self.engine.items.get(item_data_id)
+                if item is None:
+                    continue
+                inv = self.engine.inventories.get(self.engine.player.id)
+                if inv:
+                    inv.add(item, 1)
+                    self.engine.message_log.add(
+                        f"You pick up {item.display_name}.",
+                        Color.GREEN,
+                    )
+                    picked_up = True
+                # Remove the entity
+                self.engine.world.destroy_entity(ent)
+        if not picked_up:
+            self.engine.message_log.add("There's nothing to pick up.", Color.GRAY)
+
+    def cmd_trade(self, args: list[str]) -> None:
+        """Trade with an NPC."""
+        # Find NPC
+        if args:
+            target = self._find_entity_by_name(" ".join(args))
+        else:
+            target = self._find_adjacent_npc()
+        if target is None:
+            self.print("There's no one to trade with.", Color.GRAY)
+            return
+        if not self.engine.world.has_tag(target, "merchant"):
+            identity = self.engine.world.get_component(target, Identity)
+            name = identity.display_name if identity else "them"
+            self.print(f"{name} is not interested in trading.", Color.GRAY)
+            return
+        # Open trade interface (simplified)
+        identity = self.engine.world.get_component(target, Identity)
+        name = identity.display_name if identity else "Merchant"
+        self.print_header(f"Trading with {name}", Color.GOLD)
+        self.print("  (Trade functionality coming soon)", Color.GRAY)
+        self.print_separator()
+
+    def cmd_unequip(self, args: list[str]) -> None:
+        """Unequip an item from a slot."""
+        comp = self.engine.world.get_component(self.engine.player, CombatComp) if self.engine.player else None
+        if comp is None:
+            self.print("You have nothing equipped.", Color.GRAY)
+            return
+        if not args:
+            # Unequip all
+            unequipped = False
+            inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
+            for slot, item_id in list(comp.armor_ids.items()):
+                if item_id is not None and inv:
+                    item = self.engine.items.get(item_id)
+                    if item:
+                        inv.add(item, 1)
+                        unequipped = True
+                    comp.armor_ids[slot] = None
+            if comp.weapon_id is not None and inv:
+                item = self.engine.items.get(comp.weapon_id)
+                if item:
+                    inv.add(item, 1)
+                    unequipped = True
+                comp.weapon_id = None
+            if unequipped:
+                self.engine.message_log.add("You unequip all items.", Color.GREEN)
+            else:
+                self.print("You have nothing equipped.", Color.GRAY)
+            return
+        slot_name = args[0].lower()
+        if slot_name in ("weapon", "main_hand", "hand"):
+            if comp.weapon_id is not None:
+                inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
+                if inv:
+                    item = self.engine.items.get(comp.weapon_id)
+                    if item:
+                        inv.add(item, 1)
+                        self.engine.message_log.add(f"You unequip {item.display_name}.", Color.GREEN)
+                    comp.weapon_id = None
+            else:
+                self.print("You don't have a weapon equipped.", Color.GRAY)
+        elif slot_name in ("chest", "armor", "body"):
+            if comp.armor_ids.get("chest") is not None:
+                inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
+                if inv:
+                    item = self.engine.items.get(comp.armor_ids["chest"])
+                    if item:
+                        inv.add(item, 1)
+                        self.engine.message_log.add(f"You unequip {item.display_name}.", Color.GREEN)
+                    comp.armor_ids["chest"] = None
+            else:
+                self.print("You don't have chest armor equipped.", Color.GRAY)
+        else:
+            self.print(f"Unknown slot: {slot_name}", Color.GRAY)
+            self.print("Valid slots: weapon, chest", Color.GRAY)
+
     def cmd_talk(self, args: list[str]) -> None:
         """Talk to an NPC."""
         from engine.dialogue.system import DialogueEngine, DialogueLibrary
@@ -1150,49 +1261,132 @@ class GameREPL:
     def run(self) -> None:
         """Run the REPL main loop."""
         self.running = True
-        # Print welcome
-        self.print()
-        self.print("╔══════════════════════════════════════════════════════════╗",
-                   color=Color.GOLD)
-        self.print("║                                                          ║",
-                   color=Color.GOLD)
-        self.print("║            A E O N   E N G I N E                         ║",
-                   color=Color.GOLD)
-        self.print("║       A Text-Based Open-World RPG                        ║",
-                   color=Color.GOLD)
-        self.print("║                                                          ║",
-                   color=Color.GOLD)
-        self.print("╚══════════════════════════════════════════════════════════╝",
-                   color=Color.GOLD)
-        self.print()
-        self.print("Type 'help' for commands, 'q' to quit.", Color.CYAN)
-        self.print()
-        # Show initial state
-        self._refresh_display()
-        # Main loop
-        while self.running:
-            try:
-                self._tick()
-            except KeyboardInterrupt:
-                self.print("\nUse 'quit' to exit.", Color.YELLOW)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("REPL error")
-                self.print(f"Error: {exc}", Color.RED)
+        # Enable raw mode for single-key input
+        self.enable_raw_mode()
+        try:
+            # Print welcome
+            self.print()
+            self.print("╔══════════════════════════════════════════════════════════╗",
+                       color=Color.GOLD)
+            self.print("║                                                          ║",
+                       color=Color.GOLD)
+            self.print("║            A E O N   E N G I N E                         ║",
+                       color=Color.GOLD)
+            self.print("║       A Text-Based Open-World RPG                        ║",
+                       color=Color.GOLD)
+            self.print("║                                                          ║",
+                       color=Color.GOLD)
+            self.print("╚══════════════════════════════════════════════════════════╝",
+                       color=Color.GOLD)
+            self.print()
+            self.print("Type 'help' for commands, 'q' to quit.", Color.CYAN)
+            self.print("Use hjkl/wasd/arrows for movement (no Enter needed).", Color.CYAN)
+            self.print()
+            # Show initial state
+            self._refresh_display()
+            # Main loop
+            while self.running:
+                try:
+                    self._tick()
+                except KeyboardInterrupt:
+                    self.print("\nUse 'quit' to exit.", Color.YELLOW)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("REPL error")
+                    self.print(f"Error: {exc}", Color.RED)
+        finally:
+            # Always restore terminal settings
+            self.disable_raw_mode()
 
     def _tick(self) -> None:
         """One iteration of the REPL loop."""
         # Show prompt
         if self._in_dialogue:
-            self.print("Choice> ", Color.CYAN, end="")
+            sys.stdout.write("Choice> ")
         else:
-            self.print("> ", Color.CYAN, end="")
+            sys.stdout.write("> ")
         sys.stdout.flush()
-        # Read input
-        try:
-            line = input()
-        except (EOFError, KeyboardInterrupt):
-            self.running = False
-            return
+        # Read input - use raw key reading if available, otherwise fall back to input()
+        line = ""
+        if self._raw_mode:
+            # Read single key or sequence
+            key = self._read_key()
+            # Handle special keys
+            if key == "quit":
+                self.running = False
+                return
+            if key == "enter":
+                # Empty enter just advances time
+                self.engine.tick_simulation(0.05)
+                self._refresh_display()
+                return
+            if key in ("up", "down"):
+                # History navigation
+                if key == "up" and self._history:
+                    self._history_idx = max(0, self._history_idx - 1)
+                    line = self._history[self._history_idx] if self._history_idx >= 0 else ""
+                elif key == "down" and self._history:
+                    self._history_idx = min(len(self._history) - 1, self._history_idx + 1)
+                    line = self._history[self._history_idx] if self._history_idx >= 0 else ""
+                # Echo the line
+                sys.stdout.write("\r" + " " * 40 + "\r> " + line)
+                sys.stdout.flush()
+                # Continue reading until enter
+                while True:
+                    k = self._read_key()
+                    if k == "enter":
+                        break
+                    if k == "quit":
+                        self.running = False
+                        return
+                    if k == "backspace" and line:
+                        line = line[:-1]
+                        sys.stdout.write("\r> " + line + " ")
+                        sys.stdout.write("\r> " + line)
+                        sys.stdout.flush()
+                    elif len(k) == 1 and k.isprintable():
+                        line += k
+                        sys.stdout.write(line[-1])
+                        sys.stdout.flush()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            elif len(key) == 1 and key.isprintable():
+                # Single character command - check for movement or action
+                if key in SINGLE_KEYS:
+                    line = SINGLE_KEYS[key]
+                    sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
+                else:
+                    # Accumulate characters until enter
+                    line = key
+                    while True:
+                        k = self._read_key()
+                        if k == "enter":
+                            break
+                        if k == "quit":
+                            self.running = False
+                            return
+                        if k == "backspace" and line:
+                            line = line[:-1]
+                            sys.stdout.write("\r> " + line + " ")
+                            sys.stdout.write("\r> " + line)
+                            sys.stdout.flush()
+                        elif len(k) == 1 and k.isprintable():
+                            line += k
+                            sys.stdout.write(k)
+                            sys.stdout.flush()
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+            else:
+                # Unknown key, ignore
+                return
+        else:
+            # Fallback to standard input
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                self.running = False
+                return
+        
         line = line.strip()
         if not line:
             # Just advance time a bit
@@ -1201,6 +1395,7 @@ class GameREPL:
             return
         # Add to history
         self._history.append(line)
+        self._history_idx = -1
         # Handle dialogue
         if self._in_dialogue:
             if self._handle_dialogue_input(line):
@@ -1248,6 +1443,8 @@ class GameREPL:
             "equip": "equip", "eq": "equip",
             "unequip": "unequip", "uneq": "unequip",
             "drop": "drop",
+            "pickup": "pickup", "pick": "pickup", "get": "pickup",
+            "trade": "trade",
             "wait": "wait", ".": "wait",
             "rest": "rest",
             "sleep": "sleep",
