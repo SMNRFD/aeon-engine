@@ -380,6 +380,53 @@ class GameREPL:
             "engine.background_sim.system",
             fromlist=["BackgroundSimulator"]).BackgroundSimulator(self.engine.rng))
 
+    @property
+    def companies(self):
+        return self._extra("companies", lambda: __import__(
+            "engine.companies.system", fromlist=["CompanySystem"]).CompanySystem(self.engine.rng))
+
+    @property
+    def quest_consequences(self):
+        return self._extra("quest_consequences", lambda: __import__(
+            "engine.quest_consequences.system",
+            fromlist=["ConsequenceSystem"]).ConsequenceSystem(self.engine.rng))
+
+    @property
+    def mods_loader(self):
+        return self._extra("mods_loader", lambda: __import__(
+            "engine.mods_loader.system",
+            fromlist=["ModLoader"]).ModLoader(
+                str(Path(__file__).resolve().parents[2] / "mods")))
+
+    @property
+    def script_engine(self):
+        return self._extra("script_engine", lambda: __import__(
+            "engine.scripting.interpreter",
+            fromlist=["ScriptEngine"]).ScriptEngine())
+
+    @property
+    def audio_system(self):
+        return self._extra("audio_system", lambda: __import__(
+            "engine.audio.system",
+            fromlist=["AudioSystem"]).AudioSystem(play_files=False))
+
+    @property
+    def accessibility(self):
+        return self._extra("accessibility", lambda: __import__(
+            "engine.accessibility.system",
+            fromlist=["AccessibilitySystem"]).AccessibilitySystem())
+
+    @property
+    def keybindings(self):
+        return self._extra("keybindings", lambda: __import__(
+            "engine.keybindings.system",
+            fromlist=["KeyBindings"]).KeyBindings())
+
+    @property
+    def i18n_system(self):
+        # The engine already has an i18n instance — reuse it.
+        return self.engine.i18n
+
     # ----- raw-mode terminal setup ---------------------------------------- #
 
     def enable_raw_mode(self) -> None:
@@ -1350,20 +1397,22 @@ class GameREPL:
                          "go <dir>; . wait"),
             ("Actions", "look [target] (l); attack <t> (a); cast <spell>; use <item>; "
                         "equip <item>; unequip <slot>; drop <item>; pickup; talk [npc] (t); "
-                        "trade [npc]"),
+                        "trade [npc]; fish"),
             ("Character", "inventory (i); character (c); status (st); spells (sp); "
                           "skills (sk); schools"),
-            ("Magic", "cast <spell>; research <name> <school>; meditate [hours]"),
+            ("Magic", "cast <spell>; research <name> <school>; meditate [hours]; schools"),
             ("Crafting", "craft <recipe>; recipes; train <skill> [hours]; "
                          "use_skill <skill> [diff]; read <book>; books; "
                          "inscribe <rune> on <item>; runes"),
             ("Economy", "market; buy <good> [qty]; sell <good> [qty]; "
                         "bank <deposit|withdraw|balance> [amt]; loan <take> <amt> [months]; "
-                        "caravan <route> <good> <qty>; ship <route> <good> <qty>; trade_routes"),
+                        "caravan <route> <good> <qty>; ship <route> <good> <qty>; trade_routes; "
+                        "companies; company <id> [join|leave]; guilds; guild <id>"),
             ("Auctions", "auction list; auction sell <item> <price>; bid <id> <amt>; "
                          "blackmarket list; blackmarket buy <id>; fence <item>; hire_assassin <id>"),
             ("Quests", "quests; quest list; quest accept <id>; quest advance <q> <s> <o>; "
-                       "quest complete <id>; quest abandon <id>"),
+                       "quest complete <id>; quest abandon <id>; "
+                       "quest_chains; quest_chain <id>"),
             ("Factions", "factions; faction <id>; kingdoms; kingdom <id>; war <a> <b>; "
                          "peace <a> <b>; alliance <a> <b>; annex <k> <t>; election <k>"),
             ("Espionage", "recruit_spy <id> <name>; mission <spy> <type> <target>; "
@@ -1380,10 +1429,15 @@ class GameREPL:
                           "talk_artifact <id>; destroy <id> <method>"),
             ("Reputation", "reputation; hero <deed>; crime <type>"),
             ("Stealth", "stealth <on|off>; backstab [target]"),
-            ("World", "map (m); time; weather; simulate [hours]; contentpacks"),
+            ("World", "map (m); time; weather; simulate [hours]; contentpacks; structures"),
             ("Themes", "theme list; theme set <name>"),
             ("Dimensions", "dimensions; portal <from> <to>; travel <dim>"),
             ("Body Parts", "bodyparts; heal_part <part> [amount]"),
+            ("Mods & Script", "mods <list|discover|apply>; script <list|run <name>|exec <code>>"),
+            ("Audio", "audio <list|play <id>|stop <ch>|cues>"),
+            ("Accessibility", "accessibility [reader|contrast|captions|large_text] [on|off]"),
+            ("Keybindings", "keybindings [rebind <action> <key1> ...]"),
+            ("Locale", "locale [code]"),
             ("System", "save [name]; load <name>; plugins; help (?); banner; respawn; "
                          "new_game; memory [npc]; schedule; Quit (q)"),
         ]
@@ -1805,8 +1859,18 @@ class GameREPL:
         table.add_column("Lv", style="dim", justify="right")
         table.add_column("Materials", style="white")
         for r in RecipeLibrary.all():
-            mats = ", ".join(f"{n}x{k}" for k, n in r.materials.items())
-            table.add_row(r.id, r.name, r.skill_id, str(r.skill_level_required), mats)
+            # Defensive: materials is supposed to be a dict[str, int],
+            # but some default recipes accidentally store a list of tools
+            # there. Handle both cases gracefully.
+            mats = r.materials
+            if isinstance(mats, dict):
+                mats_str = ", ".join(f"{n}x{k}" for k, n in mats.items())
+            elif isinstance(mats, (list, tuple)):
+                mats_str = ", ".join(str(m) for m in mats)
+            else:
+                mats_str = str(mats)
+            table.add_row(r.id, r.name, r.skill_id,
+                          str(r.skill_level_required), mats_str)
         self.set_output(table, title="Recipes")
 
     def cmd_train(self, args: list[str]) -> None:
@@ -1861,7 +1925,9 @@ class GameREPL:
         table.add_column("Type", style="dim")
         table.add_column("Skill", style="dim")
         for b in SkillBookLibrary.all():
-            table.add_row(b.book_id, b.title, b.book_type.value, b.skill_id)
+            table.add_row(b.book_id, b.title,
+                          b.book_type.name.title().replace("_", " "),
+                          b.skill_id)
         self.set_output(table, title="Skill Books")
 
     def cmd_inscribe(self, args: list[str]) -> None:
@@ -1907,7 +1973,9 @@ class GameREPL:
         table.add_column("Type", style="dim")
         table.add_column("Power", style="dim", justify="right")
         for r in RuneLibrary.all():
-            table.add_row(r.rune_id, r.name, r.rune_type.value, str(r.base_power))
+            table.add_row(r.rune_id, r.name,
+                          r.rune_type.name.title().replace("_", " "),
+                          str(r.base_power))
         self.set_output(table, title="Runes")
 
     # ----- economy: bank / loan ------------------------------------------- #
@@ -2198,7 +2266,9 @@ class GameREPL:
         table.add_column("Type", style="dim")
         table.add_column("Description", style="dim")
         for f in FactionLibrary.all():
-            table.add_row(str(f.id), f.name, f.type.value, f.description[:60])
+            ftype = f.type if isinstance(f.type, str) else (
+                f.type.value if hasattr(f.type, "value") else str(f.type))
+            table.add_row(str(f.id), f.name, ftype, f.description[:60])
         self.set_output(table, title="Factions")
 
     def cmd_faction(self, args: list[str]) -> None:
@@ -2212,9 +2282,11 @@ class GameREPL:
             self.set_output(Text(f"Unknown faction: {args[0]}", style="red"),
                             title="Faction")
             return
+        ftype = f.type if isinstance(f.type, str) else (
+            f.type.value if hasattr(f.type, "value") else str(f.type))
         body = Text()
         body.append(f"{f.name}\n", style="bold gold1")
-        body.append(f"Type: {f.type.value}\n", style="white")
+        body.append(f"Type: {ftype}\n", style="white")
         body.append(f"Leader: {f.leader_id}\n", style="white")
         body.append(f"Population: {f.population}\n", style="white")
         body.append(f"Military: {f.military_strength}\n", style="white")
@@ -2231,7 +2303,9 @@ class GameREPL:
         table.add_column("Name", style="white")
         table.add_column("Type", style="dim")
         for k in KingdomLibrary.all():
-            table.add_row(str(k.id), k.name, k.kingdom_type.name)
+            ktype = (k.kingdom_type.name.title()
+                     if hasattr(k.kingdom_type, "name") else str(k.kingdom_type))
+            table.add_row(str(k.id), k.name, ktype)
         self.set_output(table, title="Kingdoms")
 
     def cmd_kingdom(self, args: list[str]) -> None:
@@ -2245,9 +2319,11 @@ class GameREPL:
             self.set_output(Text(f"Unknown kingdom: {args[0]}", style="red"),
                             title="Kingdom")
             return
+        ktype = (k.kingdom_type.name.title()
+                 if hasattr(k.kingdom_type, "name") else str(k.kingdom_type))
         body = Text()
         body.append(f"{k.name}\n", style="bold gold1")
-        body.append(f"Type: {k.kingdom_type.name}\n", style="white")
+        body.append(f"Type: {ktype}\n", style="white")
         body.append(f"Ruler: {getattr(k, 'ruler_id', 'unknown')}\n", style="white")
         body.append(f"Stability: {getattr(k, 'stability', 0):.1f}\n", style="white")
         body.append(f"Legitimacy: {getattr(k, 'legitimacy', 0):.1f}\n", style="white")
@@ -2504,16 +2580,20 @@ class GameREPL:
         pos = self.engine.world.get_component(self.engine.player, Position)
         loc = (pos.x, pos.y) if pos else (0, 0)
         d = self.dungeons.generate(
-            name=f"{dtype.value} #{self.engine.rng.randint(1000, 9999)}",
+            name=f"{dtype.name.title()} #{self.engine.rng.randint(1000, 9999)}",
             dungeon_type=dtype, location=loc, depth=depth,
             dungeon_id=self.engine.rng.randint(1, 99999),
         )
         body = Text()
         body.append(f"{d.name}\n", style="bold gold1")
-        body.append(f"Type: {d.dungeon_type.value}\n", style="white")
-        body.append(f"Depth: {d.depth}\n", style="white")
+        body.append(f"Type: {d.dungeon_type.name.title()}\n", style="white")
+        body.append(f"Levels: {len(d.levels)}\n", style="white")
+        body.append(f"Danger: {d.min_level}–{d.max_level}\n", style="white")
+        body.append(f"Total treasure: {d.total_treasure}cp\n", style="gold1")
         body.append(f"Location: {d.location}\n", style="dim")
-        self.msg(f"Dungeon generated: {d.name} ({d.depth} levels)", Color.GREEN)
+        if d.description:
+            body.append(f"\n{d.description}\n", style="dim")
+        self.msg(f"Dungeon generated: {d.name} ({len(d.levels)} levels)", Color.GREEN)
         self.set_output(body, title="Dungeon")
 
     def cmd_bookmark(self, args: list[str]) -> None:
@@ -2576,7 +2656,8 @@ class GameREPL:
         comp = self.engine.world.get_component(self.engine.player, SkillsComp)
         skill_level = (comp.skills.get("hunting").level
                        if comp and "hunting" in comp.skills else 1)
-        yield_ = self.animals.hunt(args[0], "region_0", (0, 0), 1, skill_level)
+        # AnimalSimulator.hunt signature: (species_id, region_id, hunters, skill_level)
+        yield_ = self.animals.hunt(args[0], 0, 1, skill_level)
         self.msg(f"You hunt {args[0]} and acquire {yield_} units.", Color.GREEN)
 
     def cmd_tame(self, args: list[str]) -> None:
@@ -2584,11 +2665,13 @@ class GameREPL:
             self.set_output(Text("Usage: tame <species_id>", style="dim"),
                             title="Tame")
             return
-        result = self.animals.domestication.tame_attempt(
+        # tame_attempt signature: (species_id, owner_id, skill_level, rng)
+        success, delta = self.animals.domestication.tame_attempt(
             args[0], self.engine.player.id, skill_level=1,
-            current_tick=self.engine.clock.time.tick,
+            rng=self.engine.rng,
         )
-        self.msg(f"Tame attempt: {result}", Color.YELLOW)
+        self.msg(f"Tame attempt: success={success}, progress +{delta:.2f}",
+                 Color.YELLOW)
 
     def cmd_livestock(self, args: list[str]) -> None:
         herds = self.animals.livestock.herd_of(self.engine.player.id)
@@ -2622,7 +2705,7 @@ class GameREPL:
         table.add_column("Rarity", style="magenta")
         table.add_column("Owner", style="dim", justify="right")
         for a in ArtifactLibrary.all():
-            table.add_row(a.artifact_id, a.name, a.rarity.value,
+            table.add_row(str(a.artifact_id), a.name, a.rarity.name.title(),
                           str(a.owner_id) if a.owner_id is not None else "—")
         self.set_output(table, title="Artifacts")
 
@@ -2799,7 +2882,8 @@ class GameREPL:
         table.add_column("Name", style="white")
         table.add_column("Type", style="dim")
         for d in self.dimensions.all_dimensions():
-            table.add_row(str(d.dimension_id), d.name, d.dimension_type.value)
+            table.add_row(str(d.dimension_id), d.name,
+                          d.dimension_type.name.title())
         if not self.dimensions.all_dimensions():
             table.add_row("—", "(none discovered)", "")
         self.set_output(table, title="Dimensions")
@@ -2834,7 +2918,9 @@ class GameREPL:
         table.add_column("Status", style="white")
         for p in parts:
             status = "OK" if p.status.name == "HEALTHY" else p.status.name
-            table.add_row(p.part_type.value, f"{p.current_hp}/{p.max_hp}", status)
+            ptype_name = (p.part_type.name.title().replace("_", " ")
+                          if hasattr(p.part_type, "name") else str(p.part_type))
+            table.add_row(ptype_name, f"{p.hp_current}/{p.hp_max}", status)
         self.set_output(table, title="Body Parts")
 
     def cmd_heal_part(self, args: list[str]) -> None:
@@ -2994,8 +3080,13 @@ class GameREPL:
                             title="Space")
             return
         sub = args[0].lower()
+        # The SpaceCombatSystem stores ships in a private dict; expose
+        # them through a small helper.
+        def _all_ships() -> list:
+            sc = self.space_combat
+            return list(getattr(sc, "_ships", {}).values())
         if sub == "fire":
-            ships = self.space_combat.all_ships()
+            ships = _all_ships()
             if not ships:
                 self.msg("No ships. Create one first.", Color.RED)
                 return
@@ -3006,11 +3097,21 @@ class GameREPL:
                                 title="Space")
                 return
             if not attacker.weapons:
-                self.space_combat.add_weapon(attacker, "laser", "Main Laser")
-            result = self.space_combat.fire_weapon(attacker, target, attacker.weapons[0])
+                from engine.space_combat.system import SpaceWeaponType
+                # Pick a sensible default weapon type.
+                wt = SpaceWeaponType.LASER if hasattr(SpaceWeaponType, "LASER") \
+                    else list(SpaceWeaponType)[0]
+                self.space_combat.add_weapon(attacker, wt, "Main Laser")
+            # Get the actual weapon object — ship.weapons stores IDs only.
+            weapon_id = attacker.weapons[0]
+            weapon_obj = self.space_combat._weapons.get(weapon_id)
+            if weapon_obj is None:
+                self.msg("Weapon not found.", Color.RED)
+                return
+            result = self.space_combat.fire_weapon(attacker, target, weapon_obj)
             self.msg(f"Fire: {result}", Color.YELLOW)
         elif sub == "launch":
-            ships = self.space_combat.all_ships()
+            ships = _all_ships()
             if not ships:
                 self.msg("No carrier.", Color.RED)
                 return
@@ -3068,6 +3169,468 @@ class GameREPL:
         else:
             self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
                             title="Mount")
+
+    # ----- companies & guilds --------------------------------------------- #
+
+    def cmd_companies(self, args: list[str]) -> None:
+        """List all trading/production companies."""
+        table = Table(title="Companies", border_style="yellow")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Type", style="dim")
+        table.add_column("Members", style="dim", justify="right")
+        table.add_column("Treasury", style="gold1", justify="right")
+        table.add_column("Monthly Profit", style="green", justify="right")
+        from engine.companies.system import CompanyType
+        type_names = {int(t): t.name.title() for t in CompanyType}
+        for c in self.companies.companies():
+            table.add_row(
+                str(c.company_id), c.name,
+                type_names.get(int(c.company_type), str(c.company_type)),
+                str(c.member_count()),
+                _format_money(c.treasury),
+                _format_money(c.monthly_profit()),
+            )
+        self.set_output(table, title="Companies")
+
+    def cmd_company(self, args: list[str]) -> None:
+        """Show details of a single company and optionally join/leave it."""
+        if not args:
+            self.set_output(Text("Usage: company <id> [join|leave]",
+                                 style="dim"), title="Company")
+            return
+        try:
+            cid = int(args[0])
+        except ValueError:
+            self.set_output(Text(f"Invalid company id: {args[0]}", style="red"),
+                            title="Company")
+            return
+        from engine.companies.system import CompanySystem
+        c = next((x for x in self.companies.companies() if x.company_id == cid), None)
+        if c is None:
+            self.set_output(Text(f"Unknown company: {cid}", style="red"),
+                            title="Company")
+            return
+        if len(args) > 1:
+            sub = args[1].lower()
+            if sub == "join":
+                if self.engine.player is None:
+                    return
+                emp = self.companies.employ(
+                    cid, self.engine.player.id, role="worker",
+                    salary=50, contract_months=12,
+                    current_tick=self.engine.clock.time.tick,
+                )
+                if emp:
+                    self.msg(f"You are now employed by {c.name}.", Color.GREEN)
+                else:
+                    self.msg("Could not join company.", Color.RED)
+            elif sub == "leave":
+                if self.engine.player is None:
+                    return
+                ok = self.companies.fire(cid, self.engine.player.id)
+                self.msg(f"You {'left' if ok else 'could not leave'} {c.name}.",
+                         Color.GREEN if ok else Color.RED)
+            else:
+                self.set_output(Text(f"Unknown subcommand: {sub}",
+                                     style="dim"), title="Company")
+                return
+            return
+        body = Text()
+        body.append(f"{c.name}\n", style="bold gold1")
+        body.append(f"Type: {c.company_type.name.title()}\n", style="white")
+        body.append(f"Owner: {c.owner_id if c.owner_id is not None else '—'}\n",
+                    style="white")
+        body.append(f"Members: {c.member_count()}\n", style="white")
+        body.append(f"Treasury: {_format_money(c.treasury)}\n", style="gold1")
+        body.append(f"Revenue: {_format_money(c.monthly_revenue)}/mo  "
+                    f"Expenses: {_format_money(c.monthly_expenses)}/mo  "
+                    f"Profit: {_format_money(c.monthly_profit())}/mo\n",
+                    style="green")
+        body.append(f"Reputation: {c.reputation:+.1f}  "
+                    f"Market share: {c.market_share * 100:.1f}%\n",
+                    style="cyan")
+        if c.description:
+            body.append(f"\n{c.description}\n", style="dim")
+        if c.members:
+            body.append("\nMembers:\n", style="bold yellow")
+            for m in c.members[:20]:
+                body.append(f"  #{m.entity_id} {m.role} "
+                            f"({m.salary_copper_per_month}cp/mo)\n",
+                            style="white")
+        self.set_output(body, title=c.name)
+
+    def cmd_guilds(self, args: list[str]) -> None:
+        """List all craft/trade guilds."""
+        table = Table(title="Guilds", border_style="magenta")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Skill", style="dim")
+        table.add_column("Members", style="dim", justify="right")
+        table.add_column("Treasury", style="gold1", justify="right")
+        table.add_column("Dues", style="dim", justify="right")
+        for g in self.companies.guilds():
+            table.add_row(str(g.guild_id), g.name, g.skill_id,
+                          str(len(g.members)), _format_money(g.treasury),
+                          f"{g.monthly_dues}cp")
+        self.set_output(table, title="Guilds")
+
+    def cmd_guild(self, args: list[str]) -> None:
+        """Show details of a single guild."""
+        if not args:
+            self.set_output(Text("Usage: guild <id>", style="dim"),
+                            title="Guild")
+            return
+        try:
+            gid = int(args[0])
+        except ValueError:
+            self.set_output(Text(f"Invalid guild id: {args[0]}", style="red"),
+                            title="Guild")
+            return
+        g = next((x for x in self.companies.guilds() if x.guild_id == gid), None)
+        if g is None:
+            self.set_output(Text(f"Unknown guild: {gid}", style="red"),
+                            title="Guild")
+            return
+        body = Text()
+        body.append(f"{g.name}\n", style="bold magenta")
+        body.append(f"Skill: {g.skill_id}\n", style="white")
+        body.append(f"Members: {len(g.members)}\n", style="white")
+        body.append(f"Treasury: {_format_money(g.treasury)}\n", style="gold1")
+        body.append(f"Monthly dues: {g.monthly_dues}cp\n", style="white")
+        body.append(f"Reputation: {g.reputation:+.1f}\n", style="cyan")
+        if g.requirements:
+            body.append("\nRequirements:\n", style="bold yellow")
+            for k, v in g.requirements.items():
+                body.append(f"  {k}: {v}\n", style="white")
+        if g.benefits:
+            body.append("\nBenefits:\n", style="bold yellow")
+            for b in g.benefits:
+                body.append(f"  • {b}\n", style="white")
+        if g.description:
+            body.append(f"\n{g.description}\n", style="dim")
+        self.set_output(body, title=g.name)
+
+    # ----- structures ------------------------------------------------------ #
+
+    def cmd_structures(self, args: list[str]) -> None:
+        """List all known structure archetypes."""
+        from engine.structures.system import StructureLibrary
+        table = Table(title="Structures", border_style="cyan")
+        table.add_column("Type", style="cyan", no_wrap=True)
+        table.add_column("Name", style="white")
+        table.add_column("Glyph", style="bold", justify="center")
+        table.add_column("Services", style="dim")
+        table.add_column("Cost", style="gold1", justify="right")
+        for s in StructureLibrary.all():
+            services = ", ".join(s.services) if s.services else "—"
+            table.add_row(s.structure_type.name, s.name, s.glyph,
+                          services,
+                          _format_money(s.build_cost_copper) if s.build_cost_copper else "—")
+        self.set_output(table, title="Structures")
+
+    # ----- quest chains & consequences ------------------------------------ #
+
+    def cmd_quest_chains(self, args: list[str]) -> None:
+        """List quest chains and show their consequences."""
+        table = Table(title="Quest Chains", border_style="gold1")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="white")
+        table.add_column("Quests", style="dim", justify="right")
+        table.add_column("Status", style="dim")
+        for c in self.quest_consequences.chains():
+            status = ("✓ complete" if c.is_complete
+                      else "✗ failed" if c.is_failed
+                      else f"step {c.current_quest_index + 1}/{len(c.quest_ids)}")
+            table.add_row(str(c.chain_id), c.name,
+                          str(len(c.quest_ids)), status)
+        self.set_output(table, title="Quest Chains")
+
+    def cmd_quest_chain(self, args: list[str]) -> None:
+        """Show details of a single quest chain."""
+        if not args:
+            self.set_output(Text("Usage: quest_chain <id>", style="dim"),
+                            title="Quest Chain")
+            return
+        try:
+            cid = int(args[0])
+        except ValueError:
+            self.set_output(Text(f"Invalid chain id: {args[0]}", style="red"),
+                            title="Quest Chain")
+            return
+        c = next((x for x in self.quest_consequences.chains()
+                  if x.chain_id == cid), None)
+        if c is None:
+            self.set_output(Text(f"Unknown chain: {cid}", style="red"),
+                            title="Quest Chain")
+            return
+        body = Text()
+        body.append(f"{c.name}\n", style="bold gold1")
+        body.append(f"Quests: {', '.join(str(q) for q in c.quest_ids)}\n",
+                    style="white")
+        body.append(f"Current: {c.current_quest_id()}\n", style="cyan")
+        body.append(f"Status: {'complete' if c.is_complete else 'failed' if c.is_failed else 'active'}\n",
+                    style="dim")
+        if c.description:
+            body.append(f"\n{c.description}\n", style="dim")
+        if c.consequences:
+            body.append("\nConsequences:\n", style="bold yellow")
+            for con in c.consequences:
+                tag = "✓" if con.is_applied else "·"
+                body.append(f"  {tag} [{con.consequence_type.name}] {con.description}\n",
+                            style="white")
+        if c.rewards:
+            body.append("\nRewards:\n", style="bold green")
+            for k, v in c.rewards.items():
+                body.append(f"  {k}: {v}\n", style="white")
+        self.set_output(body, title=c.name)
+
+    # ----- mods ------------------------------------------------------------ #
+
+    def cmd_mods(self, args: list[str]) -> None:
+        """List, load, or apply game mods."""
+        if not args:
+            self.set_output(Text("Usage: mods <list|discover|apply>",
+                                 style="dim"), title="Mods")
+            return
+        sub = args[0].lower()
+        if sub == "discover":
+            count = self.mods_loader.discover()
+            self.msg(f"Discovered {count} mods.", Color.GREEN)
+            return
+        if sub == "apply":
+            counts = self.mods_loader.apply_mods(self.engine)
+            total = sum(counts.values())
+            self.msg(f"Applied {total} mod items: {counts}", Color.GREEN)
+            return
+        if sub == "list":
+            table = Table(title="Mods", border_style="magenta")
+            table.add_column("ID", style="cyan")
+            table.add_column("Name", style="white")
+            table.add_column("Version", style="dim")
+            table.add_column("Format", style="dim")
+            table.add_column("Status", style="dim")
+            for m in self.mods_loader.registry.all():
+                status = "loaded" if m.loaded else ("error" if m.error else "discovered")
+                table.add_row(m.mod_id, m.name, m.version,
+                              m.format.name, status)
+            if not self.mods_loader.registry.all():
+                table.add_row("—", "(none — try: mods discover)", "", "", "")
+            self.set_output(table, title="Mods")
+            return
+        self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                        title="Mods")
+
+    # ----- scripting ------------------------------------------------------- #
+
+    def cmd_script(self, args: list[str]) -> None:
+        """Run or list sandboxed Python scripts."""
+        if not args:
+            self.set_output(Text(
+                "Usage: script <run <name>|list|exec <code>>",
+                style="dim"), title="Script")
+            return
+        sub = args[0].lower()
+        if sub == "list":
+            scripts = self.script_engine.list_scripts()
+            table = Table(title="Scripts", border_style="cyan")
+            table.add_column("Name", style="white")
+            for s in scripts:
+                table.add_row(s)
+            if not scripts:
+                table.add_row("(none — register with: script exec <code>)")
+            self.set_output(table, title="Scripts")
+            return
+        if sub == "run" and len(args) > 1:
+            result = self.script_engine.run(args[1])
+            body = Text()
+            if result.return_value is not None:
+                body.append(f"Result: {result.return_value}\n", style="white")
+            if result.error:
+                body.append(f"Error: {result.error}\n", style="red")
+            body.append(f"Duration: {result.duration:.3f}s\n", style="dim")
+            self.set_output(body, title=f"Script: {args[1]}")
+            return
+        if sub == "exec" and len(args) > 1:
+            code = " ".join(args[1:])
+            from engine.scripting.interpreter import ScriptContext
+            ctx = ScriptContext(
+                engine=self.engine, world=self.engine.world,
+                entity=self.engine.player, event_bus=self.engine.event_bus,
+                rng=self.engine.rng,
+                variables={"msg": lambda s: self.msg(str(s), Color.WHITE)},
+            )
+            result = self.script_engine.run_source(code, context=ctx)
+            body = Text()
+            body.append(f"Success: {result.success}\n",
+                        style="green" if result.success else "red")
+            if result.return_value is not None:
+                body.append(f"Result: {result.return_value}\n", style="white")
+            if result.error:
+                body.append(f"Error: {result.error}\n", style="red")
+            body.append(f"Duration: {result.duration:.3f}s  "
+                        f"Lines: {result.line_count}\n", style="dim")
+            self.set_output(body, title="Script Exec")
+            return
+        self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                        title="Script")
+
+    # ----- audio ----------------------------------------------------------- #
+
+    def cmd_audio(self, args: list[str]) -> None:
+        """Play, list, or stop audio cues."""
+        if not args:
+            self.set_output(Text(
+                "Usage: audio <play <id>|list|stop <channel>>",
+                style="dim"), title="Audio")
+            return
+        sub = args[0].lower()
+        if sub == "list":
+            from engine.audio.system import AudioLibrary
+            table = Table(title="Audio Library", border_style="cyan")
+            table.add_column("ID", style="cyan")
+            table.add_column("Name", style="white")
+            table.add_column("Description", style="dim")
+            table.add_column("Onomatopoeia", style="yellow")
+            for s in AudioLibrary.all():
+                table.add_row(s.id, s.name, s.description[:60],
+                              s.onomatopoeia or "—")
+            self.set_output(table, title="Audio Library")
+            return
+        if sub == "play" and len(args) > 1:
+            from engine.audio.system import AudioChannel
+            self.audio_system.play(args[1], channel=AudioChannel.SFX)
+            self.msg(f"Playing sound: {args[1]}", Color.CYAN)
+            return
+        if sub == "stop" and len(args) > 1:
+            from engine.audio.system import AudioChannel
+            try:
+                ch = AudioChannel[args[1].upper()]
+            except KeyError:
+                self.set_output(Text(f"Unknown channel: {args[1]}",
+                                     style="red"), title="Audio")
+                return
+            self.audio_system.stop_channel(ch)
+            self.msg(f"Stopped channel: {args[1]}", Color.GRAY)
+            return
+        if sub == "cues":
+            cues = self.audio_system.recent_cues(20)
+            table = Table(title="Recent Audio Cues", border_style="cyan")
+            table.add_column("Sound", style="cyan")
+            table.add_column("Text", style="white")
+            table.add_column("Priority", style="dim", justify="right")
+            for cue in cues:
+                table.add_row(cue.sound_id, cue.text, str(cue.priority))
+            if not cues:
+                table.add_row("—", "(no cues yet)", "")
+            self.set_output(table, title="Audio Cues")
+            return
+        self.set_output(Text(f"Unknown subcommand: {sub}", style="red"),
+                        title="Audio")
+
+    # ----- accessibility --------------------------------------------------- #
+
+    def cmd_accessibility(self, args: list[str]) -> None:
+        """Show or configure accessibility options."""
+        if not args:
+            cfg = self.accessibility.config
+            body = Text()
+            body.append("Accessibility Configuration\n", style="bold cyan")
+            body.append(f"  Screen reader mode: {cfg.screen_reader.enabled}\n",
+                        style="white")
+            body.append(f"  Color blindness: {cfg.color_blindness.name}\n",
+                        style="white")
+            body.append(f"  Large text: {cfg.large_text}\n", style="white")
+            body.append(f"  High contrast: {cfg.high_contrast}\n", style="white")
+            body.append(f"  Reduced motion: {cfg.reduced_motion}\n",
+                        style="white")
+            body.append(f"  Audio cues: {cfg.audio_cues}\n", style="white")
+            body.append(f"  Caption sounds: {cfg.caption_sounds}\n",
+                        style="white")
+            body.append(f"  Text-to-speech: {cfg.text_to_speech}\n",
+                        style="white")
+            body.append(f"  Keyboard only: {cfg.keyboard_only}\n", style="white")
+            body.append("\nUsage: accessibility "
+                        "[reader|contrast|captions|large_text|reduced_motion] "
+                        "[on|off]\n", style="dim")
+            self.set_output(body, title="Accessibility")
+            return
+        sub = args[0].lower()
+        toggles = {
+            "reader": "screen_reader.enabled",
+            "contrast": "high_contrast",
+            "captions": "caption_sounds",
+            "large_text": "large_text",
+            "reduced_motion": "reduced_motion",
+            "audio_cues": "audio_cues",
+            "tts": "text_to_speech",
+            "keyboard": "keyboard_only",
+        }
+        if sub in toggles and len(args) > 1:
+            attr_path = toggles[sub]
+            obj = (self.accessibility.config.screen_reader
+                   if attr_path.startswith("screen_reader.")
+                   else self.accessibility.config)
+            attr = attr_path.split(".")[-1]
+            setattr(obj, attr, args[1].lower() == "on")
+            self.msg(f"{sub}: {args[1].lower()}",
+                     Color.GREEN if args[1].lower() == "on" else Color.GRAY)
+            return
+        self.set_output(Text(
+            "Usage: accessibility "
+            "[reader|contrast|captions|large_text|reduced_motion] [on|off]",
+            style="dim"), title="Accessibility")
+
+    # ----- keybindings ----------------------------------------------------- #
+
+    def cmd_keybindings(self, args: list[str]) -> None:
+        """List or rebind keys."""
+        if not args:
+            table = Table(title="Key Bindings", border_style="cyan")
+            table.add_column("Action", style="cyan")
+            table.add_column("Keys", style="white")
+            from engine.keybindings.system import KeyAction
+            for action in KeyAction:
+                keys = self.keybindings.keys_for(action)
+                table.add_row(action.name, ", ".join(keys) if keys else "(unbound)")
+            self.set_output(table, title="Key Bindings")
+            return
+        if args[0].lower() == "rebind" and len(args) >= 3:
+            from engine.keybindings.system import KeyAction
+            try:
+                action = KeyAction[args[1].upper()]
+            except KeyError:
+                self.set_output(Text(f"Unknown action: {args[1]}",
+                                     style="red"), title="Keybindings")
+                return
+            keys = args[2:]
+            self.keybindings.rebind(action, keys)
+            self.msg(f"Rebound {action.name} to {', '.join(keys)}", Color.GREEN)
+            return
+        self.set_output(Text("Usage: keybindings [rebind <action> <key1> ...]",
+                             style="dim"), title="Keybindings")
+
+    # ----- localization ---------------------------------------------------- #
+
+    def cmd_locale(self, args: list[str]) -> None:
+        """Show or set the current locale."""
+        if not args:
+            current = self.i18n_system.locale.code
+            available = self.i18n_system.available_locales()
+            body = Text()
+            body.append(f"Current locale: {current}\n", style="bold cyan")
+            body.append(f"RTL: {self.i18n_system.rtl}\n", style="white")
+            body.append(f"Available: {', '.join(available) if available else '(none)'}\n",
+                        style="white")
+            body.append("\nUsage: locale <code> (e.g. en_US, fr_FR, de_DE)\n",
+                        style="dim")
+            self.set_output(body, title="Locale")
+            return
+        try:
+            self.i18n_system.set_locale(args[0])
+            self.msg(f"Locale set to {args[0]}.", Color.GREEN)
+        except Exception as exc:  # noqa: BLE001
+            self.msg(f"Could not set locale: {exc}", Color.RED)
 
     # ----- entity lookup --------------------------------------------------- #
 
@@ -3276,10 +3839,16 @@ class GameREPL:
     def _scrollable_output_panel(self) -> Panel:
         """Command-output panel with scrollbar and vertical scrolling.
 
-        The output renderable is rendered to a plain-text string, then
-        split into lines. We apply the current scroll offset (lines from
-        the bottom) and show a scrollbar on the right edge so the player
-        can tell where they are in a long listing.
+        The output renderable is rendered to an ANSI-coloured string (so all
+        rich markup — Tables, Text styles, bars, etc. — is preserved), then
+        converted back into a ``rich.text.Text`` via ``Text.from_ansi``.
+        This means the player sees a *fully styled* view of the command
+        output (colours, bold, table borders) inside the scroll panel,
+        rather than a stripped plain-text dump.
+
+        The panel applies a vertical scroll offset (lines from the bottom)
+        and shows a scrollbar indicator in the title so the player can
+        tell where they are in a long listing.
         """
         from io import StringIO
         renderable = self._command_output_panel()
@@ -3288,15 +3857,29 @@ class GameREPL:
             return Panel(Text("(no command output yet — try 'help')", style="dim"),
                          title="[bold magenta]Output[/]",
                          border_style="magenta", expand=True)
-        # Render the inner renderable to plain text to count lines.
+        # Extract the inner renderable (the Panel wraps it in .renderable).
+        inner = (renderable.renderable
+                 if hasattr(renderable, "renderable") else renderable)
+        # Compute a width that matches the actual output panel area.
+        # The live layout splits the lower row 50/50 between messages and
+        # output, and the panel border eats 4 columns. Fall back to ~70.
+        try:
+            console_width = self.console.width
+        except Exception:  # noqa: BLE001
+            console_width = 100
+        panel_width = max(40, (console_width // 2) - 4)
+        # Render WITH ANSI colour so we can reconstruct styled Text.
         try:
             buf = StringIO()
-            tmp = Console(file=buf, force_terminal=False, color_system=None,
-                          highlight=False, soft_wrap=True, width=60)
-            tmp.print(renderable.renderable if hasattr(renderable, "renderable") else renderable)
-            all_lines = buf.getvalue().splitlines()
+            tmp = Console(
+                file=buf, force_terminal=True, color_system="256",
+                highlight=False, soft_wrap=True, width=panel_width,
+            )
+            tmp.print(inner)
+            ansi_text = buf.getvalue()
         except Exception:  # noqa: BLE001
-            all_lines = [str(renderable)]
+            ansi_text = str(inner)
+        all_lines = ansi_text.splitlines()
         self._output_line_count = len(all_lines)
         # Determine the visible window. The panel height is roughly
         # determined by the layout ratio; assume ~15 lines visible.
@@ -3305,7 +3888,7 @@ class GameREPL:
         if total <= visible_h:
             # Everything fits — no scroll needed.
             self._output_scroll = 0
-            content = Text("\n".join(all_lines))
+            visible = "\n".join(all_lines)
         else:
             # Clamp scroll offset.
             max_scroll = total - visible_h
@@ -3317,14 +3900,24 @@ class GameREPL:
             # lines. scroll=N shows lines [total-visible_h-N : total-N].
             start = max(0, total - visible_h - self._output_scroll)
             end = start + visible_h
-            visible_lines = all_lines[start:end]
-            content = Text("\n".join(visible_lines))
+            visible = "\n".join(all_lines[start:end])
+        # Reconstruct a styled Text from the ANSI string. This preserves
+        # all colours, bold, table borders, etc. that the original rich
+        # renderable produced.
+        content = Text.from_ansi(visible)
         # Build a scrollbar indicator for the title.
         if self._output_line_count > visible_h:
             scroll_pct = (self._output_scroll / max(1, self._output_line_count - visible_h))
+            # Visual scrollbar: indicator position reflects the visible
+            # window's location in the document. scroll=0 means we're
+            # showing the BOTTOM of the content (indicator at right);
+            # scroll=max means we're showing the TOP (indicator at left).
+            bar_len = 10
+            pos = int((1.0 - scroll_pct) * (bar_len - 1))
+            scrollbar = " " * pos + "█" + " " * (bar_len - pos - 1)
             title = (f"[bold magenta]Output[/]  "
                      f"[dim]{self._output_line_count} lines  "
-                     f"↑↓ scroll  ({int(scroll_pct * 100)}%)[/]")
+                     f"↑↓ scroll  [{scrollbar}]  ({int(scroll_pct * 100)}%)[/]")
         else:
             title = "[bold magenta]Output[/]"
         return Panel(content, title=title, border_style="magenta", expand=True)
@@ -3942,6 +4535,17 @@ class GameREPL:
             "research": "research",
             "meditate": "meditate",
             "schools": "schools",
+            # --- new: full system integration ---
+            "companies": "companies", "company": "company",
+            "guilds": "guilds", "guild": "guild",
+            "structures": "structures",
+            "quest_chains": "quest_chains", "quest_chain": "quest_chain",
+            "mods": "mods",
+            "script": "script",
+            "audio": "audio",
+            "accessibility": "accessibility",
+            "keybindings": "keybindings", "keys": "keybindings",
+            "locale": "locale", "i18n": "locale",
         }
 
 
