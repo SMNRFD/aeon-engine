@@ -153,3 +153,9 @@ See `docs/ARCHITECTURE.md` and `docs/DIAGRAMS.md` for the full architecture docu
 ## License
 
 MIT
+
+---
+
+## AI Agent
+
+z.ai GLM 5.2
