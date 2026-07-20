@@ -19,16 +19,16 @@ It is built around an Entity-Component-System core, an event bus, and a plugin m
 
 ```bash
 # Headless verification (generates world, ticks once, exits)
-python main.py --headless --seed 42 --width 60 --height 40
+python engine/repl/repl.py --headless --seed 42 --width 60 --height 40
 
 # Full game (terminal UI)
-python main.py --seed 42 --width 80 --height 50
+python engine/repl/repl.py --seed 42 --width 80 --height 50
 
 # Load a saved game
-python main.py --load my_save
+python engine/repl/repl.py --load my_save
 
 # Debug mode (cheat commands enabled)
-python main.py --debug
+python engine/repl/repl.py --debug
 ```
 
 ### Run Tests
