@@ -1,2 +1,2 @@
 [console_scripts]
-aeon = main:main
+aeon = engine.repl.repl:main
