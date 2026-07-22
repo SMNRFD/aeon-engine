@@ -178,6 +178,30 @@ class Engine:
         self._last_tick_time: float = 0.0
         self._last_autosave_tick: int = 0
 
+        # ----- Bannerlord-style travel / follow / auto-attack state -----
+        # When True, the engine auto-attacks adjacent hostiles at the end of
+        # each tick (after the AI has acted). Toggled via cmd_autoattack.
+        self.auto_attack_enabled: bool = False
+        # Pending travel path (list of (x, y) tiles). When non-empty, each
+        # tick consumes the next tile and walks the player there, while the
+        # world keeps simulating around them — exactly like Mount & Blade's
+        # overland travel.
+        self._travel_path: list[tuple[int, int]] = []
+        # When non-None, the engine walks the player toward this entity's
+        # position each tick (catch-up / pursuit). Cleared when the entity
+        # dies or the player catches up.
+        self._follow_target_id: Optional[int] = None
+        # When non-None, the engine has detected a hostile encounter and the
+        # REPL should show the encounter panel next tick. Set by move_player
+        # on a hostile bump; cleared by the REPL after the player chooses.
+        self.pending_encounter_id: Optional[int] = None
+        # Settlements placed at world-gen (list of (x, y, name)). Used by
+        # the holy-map renderer and the structure layer.
+        self.settlements: list[tuple[int, int, str]] = []
+        # Placed structures (instances on the map). Keyed by placement_id.
+        self.structure_placements: dict[int, Any] = {}
+        self._next_placement_id: int = 1
+
         log.info("Engine initialised")
 
     # ---------- world setup ----------
@@ -202,7 +226,7 @@ class Engine:
         log.info("World generated: %dx%d", self.world_map.width, self.world_map.height)
 
     def _populate_world(self) -> None:
-        """Spawn NPCs and creatures in the world."""
+        """Spawn NPCs, creatures, villages, castles and kingdom territories."""
         if self.world_map is None:
             return
         from engine.world.terrain import TerrainType
@@ -237,13 +261,187 @@ class Engine:
         for _ in range(creature_count):
             tile = self.rng.choice(walkable)
             name, glyph, color, hp, strn, agi, hostile = self.rng.choice(creature_types)
-            self.factory.create_creature(
+            creature = self.factory.create_creature(
                 name=name, glyph=glyph, color=color,
                 x=tile.x, y=tile.y, hp=hp, strength=strn, agility=agi,
                 aggressive=hostile,
             )
-            self.spatial.insert(self.world.create_entity(), tile.x, tile.y)  # noop; creature already added
-        log.info("Populated world with %d NPCs and ~40 creatures", npc_count)
+            # FIX: insert the actual creature entity (was: world.create_entity())
+            self.spatial.insert(creature, tile.x, tile.y)
+        log.info("Populated world with %d NPCs and ~%d creatures", npc_count, creature_count)
+        # ----- Place villages, castles, kingdom capitals -----
+        # These are derived from the road tiles the generator placed, since
+        # the generator discards the explicit settlement list. We re-discover
+        # them by scanning for ROAD tiles that form small clusters.
+        self._place_settlements_and_kingdoms()
+
+    def _place_settlements_and_kingdoms(self) -> None:
+        """Discover settlement clusters from ROAD tiles and place structures,
+        kingdom territories, and map markers on them.
+
+        This populates:
+          * ``self.settlements`` — list of (x, y, name)
+          * ``self.structure_placements`` — placed StructurePlacement instances
+          * ``self.kingdoms`` (KingdomSystem) — territories + capitals
+          * ``self.bookmarks`` (BookmarkManager) — map markers
+        """
+        if self.world_map is None:
+            return
+        from engine.world.terrain import TerrainType
+        from engine.structures.system import (
+            StructurePlacement, StructureType, StructureLibrary,
+        )
+        from engine.kingdoms.system import KingdomLibrary
+        from engine.bookmarks.system import BookmarkManager
+        # ----- 1. Discover settlement clusters from ROAD tiles -----
+        road_tiles = [t for t in self.world_map.iter_tiles()
+                      if t.terrain_type == TerrainType.ROAD]
+        if not road_tiles:
+            return
+        # Cluster road tiles by connectivity (flood-fill). Each cluster is a
+        # settlement. Cap at 12 to keep things sane.
+        clusters: list[list[tuple[int, int]]] = []
+        visited: set[tuple[int, int]] = set()
+        road_set = {(t.x, t.y) for t in road_tiles}
+        for t in road_tiles:
+            if (t.x, t.y) in visited:
+                continue
+            # BFS
+            stack = [(t.x, t.y)]
+            cluster: list[tuple[int, int]] = []
+            while stack:
+                cx, cy = stack.pop()
+                if (cx, cy) in visited:
+                    continue
+                visited.add((cx, cy))
+                cluster.append((cx, cy))
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        if (cx + dx, cy + dy) in road_set and (cx + dx, cy + dy) not in visited:
+                            stack.append((cx + dx, cy + dy))
+            if len(cluster) >= 3:  # ignore tiny road fragments
+                clusters.append(cluster)
+            if len(clusters) >= 12:
+                break
+        # ----- 2. For each cluster, pick a center and name it -----
+        settlement_names = [
+            "Brackton", "Oakhaven", "Rivermouth", "Stonebridge", "Goldhollow",
+            "Ravensford", "Whitewater", "Ironforge", "Frosthollow", "Sunpeak",
+            "Mistwood", "Elderbrook", "Thornwall", "Brightmeadow", "Darkhollow",
+        ]
+        self.settlements = []
+        for i, cluster in enumerate(clusters):
+            # Pick a center: the tile closest to the cluster's centroid.
+            cx = sum(p[0] for p in cluster) // len(cluster)
+            cy = sum(p[1] for p in cluster) // len(cluster)
+            # Find the actual road tile nearest to the centroid.
+            best = min(cluster, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            name = settlement_names[i % len(settlement_names)]
+            self.settlements.append((best[0], best[1], name))
+        # ----- 3. Place structures (castle + houses + inn + temple) -----
+        # Reset placement state in case this is a new_game() re-population.
+        self.structure_placements = {}
+        self._next_placement_id = 1
+        for sx, sy, name in self.settlements:
+            # Castle / keep at the settlement center (mark the tile).
+            self._place_structure(StructureType.CASTLE, f"{name} Castle", sx, sy)
+            # Surround with 2-4 houses, an inn, and a temple on adjacent walkable tiles.
+            surround_types = [
+                (StructureType.HOUSE, "House"),
+                (StructureType.HOUSE, "House"),
+                (StructureType.INN, f"{name} Inn"),
+                (StructureType.TEMPLE, f"{name} Temple"),
+                (StructureType.SHOP, f"{name} Shop"),
+                (StructureType.MARKET, f"{name} Market"),
+            ]
+            placed_count = 0
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if dx == 0 and dy == 0:
+                        continue
+                    if placed_count >= len(surround_types):
+                        break
+                    nx, ny = sx + dx, sy + dy
+                    tile = self.world_map.get_tile(nx, ny)
+                    if tile is None or not tile.is_walkable:
+                        continue
+                    if tile.terrain_type == TerrainType.ROAD:
+                        continue
+                    stype, sname = surround_types[placed_count]
+                    self._place_structure(stype, sname, nx, ny)
+                    placed_count += 1
+        # ----- 4. Assign settlements to kingdoms -----
+        # Make sure the kingdom system has been initialised (it's lazy on the
+        # REPL side; we use a fresh KingdomSystem here just for territory
+        # creation, since KingdomLibrary is the global registry).
+        from engine.kingdoms.system import KingdomSystem
+        ks = KingdomSystem(self.rng)
+        kingdoms = KingdomLibrary.all()
+        if not kingdoms:
+            return
+        # Each settlement becomes a territory; first settlement of each
+        # kingdom becomes its capital. We assign in round-robin so each
+        # kingdom gets at least one territory.
+        for i, (sx, sy, sname) in enumerate(self.settlements):
+            kingdom = kingdoms[i % len(kingdoms)]
+            territory = ks.create_territory(
+                name=sname, location=(sx, sy),
+                size=self.rng.randint(50, 300),
+                population=self.rng.randint(100, 5000),
+                has_capital=(kingdom.capital_territory_id is None),
+            )
+            kingdom.territories.append(territory.territory_id)
+            if kingdom.capital_territory_id is None:
+                kingdom.capital_territory_id = territory.territory_id
+                kingdom.population += territory.population
+                kingdom.military_strength += self.rng.randint(50, 500)
+        # Stash the KingdomSystem instance on the engine so the REPL's lazy
+        # `kingdoms` property picks it up (it constructs a new one otherwise;
+        # we'll also expose territories via the engine directly).
+        self._kingdom_system = ks
+        # ----- 5. Register map markers for the holy map -----
+        # Use the BookmarkManager (also lazy on the REPL). We create one
+        # here and stash it so the REPL's `bookmarks` property picks it up.
+        bm = BookmarkManager()
+        for sx, sy, sname in self.settlements:
+            # Mark the settlement as a "city" marker.
+            bm.add_marker(
+                name=sname, x=sx, y=sy,
+                marker_type="city",
+                description=f"The settlement of {sname}.",
+                icon="⌂", color=215,
+                is_visible=True, requires_discovery=False,
+            )
+            # Also mark the castle.
+            bm.add_marker(
+                name=f"{sname} Castle", x=sx, y=sy,
+                marker_type="castle",
+                description=f"The castle of {sname}.",
+                icon="⚰", color=220,
+                is_visible=True, requires_discovery=False,
+            )
+        self._bookmarks_mgr = bm
+
+    def _place_structure(self, structure_type, name: str, x: int, y: int) -> Any:
+        """Place a structure on the map and register it."""
+        from engine.structures.system import StructurePlacement, StructureLibrary
+        arch = StructureLibrary.get(structure_type)
+        placement = StructurePlacement(
+            placement_id=self._next_placement_id,
+            structure_type=structure_type,
+            name=name,
+            x=x, y=y,
+            description=arch.description if arch else "",
+        )
+        self._next_placement_id += 1
+        self.structure_placements[placement.placement_id] = placement
+        # Pin to the tile so the renderer can show it.
+        tile = self.world_map.get_tile(x, y) if self.world_map else None
+        if tile is not None:
+            tile.structure_id = placement.placement_id
+        return placement
 
     def _random_name(self) -> str:
         first = self.rng.choice([
@@ -280,12 +478,18 @@ class Engine:
         weapon = self.item_generator.generate(params, self.items.next_id())
         self.items.register(weapon)
         inv.add(weapon)
-        # Equip it
+        # Equip it — dual-write to BOTH Combat.weapon_id (for combat code)
+        # AND Inventory._equipment (for inventory display). This is the
+        # fix for the "equipped items not shown in inventory" bug.
+        from engine.inventory.inventory import EquipmentSlot
         comp = self.world.get_component(self.player, type(self.player).__class__) if False else None
         from engine.entities.components import Combat as CombatComp
         combat_comp = self.world.get_component(self.player, CombatComp)
         if combat_comp:
             combat_comp.weapon_id = weapon.id
+        # Remove from backpack and put in the MAIN_HAND equipment slot.
+        inv.remove(weapon.id, 1)
+        inv._equipment[EquipmentSlot.MAIN_HAND] = weapon.id
         # Starter consumables
         for archetype in ("health_potion", "health_potion", "bread", "water_flask", "torch"):
             p = ItemGenerationParams(archetype=archetype)
@@ -399,6 +603,10 @@ class Engine:
         """Advance one simulation tick."""
         if dt is None:
             dt = 1.0 / self.clock.tps
+        # Don't tick the world if the player is dead — the game-over panel
+        # is showing and we want a clean pause until the player chooses.
+        if getattr(self, "player_dead", False):
+            return
         # Advance game time
         self.clock.tick(dt)
         # Update needs
@@ -418,6 +626,18 @@ class Engine:
         self.skills.decay(self.world, dt)
         # Update AI for all entities with AI component
         self._update_ai()
+        # ----- Bannerlord-style travel / follow -----
+        # Walk the player one tile along the pending path, or one step toward
+        # the follow target. The world has just been updated above (AI moved,
+        # needs decayed, etc.), so this matches Bannerlord's "world keeps
+        # simulating while you travel" feel.
+        self._advance_travel()
+        # ----- Auto-attack -----
+        # If enabled, the player auto-attacks adjacent hostiles. This runs
+        # AFTER the AI so the player can retaliate even when the player's
+        # typing speed is slower than the AI's tick rate.
+        if self.auto_attack_enabled:
+            self._auto_attack_hostiles()
         # NPC daily schedules — drive NPCs toward routine locations
         # based on time of day (work, home, tavern, etc.).
         self._update_schedules()
@@ -437,12 +657,30 @@ class Engine:
         panel. The simulation pauses for the player (other entities keep
         simulating) until the REPL calls ``respawn_player()`` or
         ``new_game()``.
+
+        This is the canonical death detector — it runs LAST in every tick
+        so all damage sources for this tick are applied first. The AI
+        combat path does NOT destroy the player entity (see ``_handle_death``
+        which special-cases the player); it only reduces HP, so this method
+        is guaranteed to see the lethal HP value.
         """
         if self.player is None:
             return
+        # Defensive: if the player entity was destroyed (legacy code path
+        # or a buggy plugin), reconstruct a minimal dead-state so the
+        # game-over panel still appears.
+        if not self.world.is_alive(self.player):
+            if not getattr(self, "player_dead", False):
+                self.player_dead = True
+                self.message_log.add("You have been slain! Game over.", Color.RED)
+                self.message_log.add("  Press R to respawn, N for a new game, Q to quit.",
+                                     Color.YELLOW)
+            return
         from engine.entities.components import Health as HealthComp, Identity
         health = self.world.get_component(self.player, HealthComp)
-        if health is None or health.current > 0:
+        if health is None:
+            return
+        if health.current > 0:
             return
         if getattr(self, "player_dead", False):
             return  # already dead — don't re-trigger
@@ -458,18 +696,37 @@ class Engine:
         """Respawn the dead player at the spawn point with full HP.
 
         Called by the REPL when the player presses R on the game-over
-        screen. Applies a wealth penalty (lose half of carried copper)
-        and resets needs, but keeps the same world and character.
+        screen, or types ``respawn``. Applies a wealth penalty (lose half
+        of carried wealth) and resets needs, mana, and ALL status effects,
+        but keeps the same world and character.
+
+        This is safe to call repeatedly — every field is re-reset each
+        call, so the second death (and the third, and so on) recovers
+        correctly. The key fix vs. the original implementation is that
+        status effects are cleared (a player who died of poison no longer
+        re-dies on the next tick) and mana is restored.
         """
         if self.player is None or self.world_map is None:
             return
         from engine.entities.components import (
             Health as HealthComp, Needs as NeedsComp, Position as PosComp,
-            Wealth, Identity,
+            Wealth, Identity, Combat as CombatComp,
         )
+        from engine.magic.spells import Mana
+        # If the player entity was destroyed (legacy path), rebuild it.
+        if not self.world.is_alive(self.player):
+            log.warning("Player entity was destroyed — rebuilding on respawn.")
+            old_name = "Hero"
+            self.player = self.factory.create_player(old_name)
+            # Re-add to inventories mapping (factory doesn't do this).
+            if self.player.id not in self.inventories:
+                self.inventories[self.player.id] = Inventory(capacity=30, max_weight=60.0)
+            # Re-add Mana (factory doesn't).
+            self.world.add_component(self.player, Mana(current=50, maximum=50, regeneration=0.5))
         health = self.world.get_component(self.player, HealthComp)
         if health:
             health.current = health.maximum
+            health.regeneration = max(health.regeneration, 1.0)
         needs = self.world.get_component(self.player, NeedsComp)
         if needs:
             needs.hunger = 0.0
@@ -477,6 +734,23 @@ class Engine:
             needs.fatigue = 50.0
             needs.sleep = 50.0
             needs.warmth = 37.0
+            needs.morale = 75.0
+            needs.comfort = 50.0
+            needs.sanity = 100.0
+        # Reset mana to full.
+        mana = self.world.get_component(self.player, Mana)
+        if mana:
+            mana.current = mana.maximum
+        else:
+            # Add a Mana component if the player didn't have one.
+            self.world.add_component(self.player, Mana(current=50, maximum=50, regeneration=0.5))
+        # Clear ALL status effects (poison, disease, bleed, etc.) so the
+        # player doesn't instantly re-die from a lingering DoT.
+        combat_comp = self.world.get_component(self.player, CombatComp)
+        if combat_comp:
+            combat_comp.status_effects.clear()
+            combat_comp.in_combat = False
+            combat_comp.cooldown = 0.0
         pos = self.world.get_component(self.player, PosComp)
         if pos:
             pos.x = self.world_map.spawn_point.x
@@ -487,6 +761,10 @@ class Engine:
             wealth.copper = wealth.copper // 2
             wealth.silver = wealth.silver // 2
             wealth.gold = wealth.gold // 2
+        # Cancel any in-progress travel / follow.
+        self._travel_path = []
+        self._follow_target_id = None
+        self.pending_encounter_id = None
         self._update_visibility()
         self.player_dead = False
         identity = self.world.get_component(self.player, Identity)
@@ -514,6 +792,14 @@ class Engine:
         self.quest_trackers = {}
         self.player = None
         self.player_dead = False
+        # Clear Bannerlord-style state.
+        self.auto_attack_enabled = False
+        self._travel_path = []
+        self._follow_target_id = None
+        self.pending_encounter_id = None
+        self.settlements = []
+        self.structure_placements = {}
+        self._next_placement_id = 1
         # Clear the message log.
         if self.message_log:
             self.message_log.messages.clear()
@@ -582,13 +868,9 @@ class Engine:
             tile = self.world_map.get_tile(new_x, new_y)
             if tile is None or not tile.is_walkable:
                 continue
-            # Don't step onto another entity.
-            blocked = False
-            for other, (op,) in self.world.view(PosComp):
-                if other.id != entity.id and op.x == new_x and op.y == new_y:
-                    blocked = True
-                    break
-            if blocked:
+            # Don't step onto another entity — use a spatial query for speed.
+            occupants = self.spatial.query_cell(new_x, new_y)
+            if any(o.id != entity.id for o in occupants):
                 continue
             self.spatial.update(entity, new_x, new_y)
             pos.x = new_x
@@ -608,22 +890,29 @@ class Engine:
             mem.memories = mem.memories[-30:]
 
     def _update_ai(self) -> None:
-        """Tick AI for all NPCs and creatures."""
-        from engine.entities.components import AI as AIComp, Position as PosComp, Identity
+        """Tick AI for all NPCs and creatures.
+
+        Uses the spatial grid for nearby-entity queries (O(nearby) instead
+        of O(all entities)) so AI scales to large populations. Also skips
+        pacified creatures (those with ``Memory.knowledge["pacified_by_player"]``
+        set by the ``give`` command) — they will not target the player.
+        """
+        from engine.entities.components import (
+            AI as AIComp, Position as PosComp, Identity, Memory as MemoryComp,
+        )
         for entity, (ai, pos) in self.world.view(AIComp, PosComp):
             if ai.controller == "player":
                 continue
             controller = self.ai_registry.get(ai.controller)
             if controller is None:
                 continue
-            # Find nearby entities
+            # Use the spatial grid to find nearby entities (radius 12).
+            # This is O(nearby) instead of O(all entities).
             nearby: list[tuple[Entity, float]] = []
-            for other, (op,) in self.world.view(PosComp):
+            for other, dist in self.spatial.query_radius(pos.x, pos.y, 12):
                 if other.id == entity.id:
                     continue
-                d = ((op.x - pos.x) ** 2 + (op.y - pos.y) ** 2) ** 0.5
-                if d <= 12:
-                    nearby.append((other, d))
+                nearby.append((other, dist))
             ctx = AIContext(
                 world=self.world, entity=entity, rng=self.rng,
                 current_tick=self.clock.time.tick,
@@ -633,6 +922,17 @@ class Engine:
             )
             try:
                 action = controller.decide(ctx)
+                # Pacified check: if this entity has been pacified by the
+                # player (via the `give` command), suppress any attack
+                # action targeting the player.
+                if action and action.type == "attack" and action.target_entity is not None:
+                    mem = self.world.get_component(entity, MemoryComp)
+                    if mem and mem.knowledge.get("pacified_by_player"):
+                        # Convert to a wait action — the entity will not
+                        # attack the player even if the AI controller
+                        # suggested it.
+                        from engine.npc.ai import AIAction
+                        action = AIAction(type="wait")
                 self._execute_ai_action(entity, action)
             except Exception:  # noqa: BLE001
                 log.exception("AI controller %s raised on entity %d",
@@ -657,10 +957,10 @@ class Engine:
             if tile is None or not tile.is_walkable:
                 # Try adjacent tiles
                 return
-            # Check if another entity occupies the tile
-            for other, (op,) in self.world.view(Position):
-                if other.id != entity.id and op.x == tx and op.y == ty:
-                    return
+            # Check if another entity occupies the tile — spatial query.
+            occupants = self.spatial.query_cell(tx, ty)
+            if any(o.id != entity.id for o in occupants):
+                return
             self.spatial.update(entity, tx, ty)
             pos.x = tx
             pos.y = ty
@@ -719,8 +1019,43 @@ class Engine:
             return
 
     def _handle_death(self, victim: Entity, killer: Entity) -> None:
-        """Handle an entity death."""
-        from engine.entities.components import Identity, Wealth
+        """Handle an entity death.
+
+        IMPORTANT: when the victim is the player, we do NOT destroy the
+        player entity. We only drop the player's HP to 0, drop inventory,
+        and let ``_check_player_death`` (called at the end of every tick)
+        flip the ``player_dead`` flag and trigger the game-over panel.
+        This is the fix for the "game over cycle" bug where the player
+        was destroyed and ``respawn_player`` couldn't recover.
+        """
+        from engine.entities.components import Identity, Wealth, Health as HealthComp
+        # ----- Special case: the player is the victim -----
+        if self.player is not None and victim.id == self.player.id:
+            # Drop HP to 0 so _check_player_death triggers.
+            health = self.world.get_component(victim, HealthComp)
+            if health:
+                health.current = 0
+            killer_id_name = "unknown"
+            killer_id_comp = self.world.get_component(killer, Identity)
+            if killer_id_comp:
+                killer_id_name = killer_id_comp.display_name
+            identity = self.world.get_component(victim, Identity)
+            name = identity.display_name if identity else "Hero"
+            self.message_log.add(
+                f"{name} was struck down by {killer_id_name}!", Color.RED)
+            # Award XP to the killer (so the AI that killed the player
+            # still benefits — this also matches the original behaviour).
+            from engine.entities.components import Skills as SkillsComp
+            killer_skills = self.world.get_component(killer, SkillsComp)
+            if killer_skills is None:
+                killer_skills = SkillsComp()
+                self.world.add_component(killer, killer_skills)
+            self.skills.add_xp(killer, "swordsmanship", 30, self.world)
+            # DO NOT destroy the player entity, DO NOT remove from spatial.
+            # The canonical death path (_check_player_death) takes it from
+            # here. Return without touching the player further.
+            return
+        # ----- Standard death (NPC or creature) -----
         identity = self.world.get_component(victim, Identity)
         name = identity.display_name if identity else f"entity#{victim.id}"
         killer_id_name = "unknown"
@@ -731,7 +1066,6 @@ class Engine:
         # Drop inventory
         inv = self.inventories.get(victim.id)
         if inv and self.world_map:
-            pos = self.world.get_component(victim, type(victim).__class__) if False else None
             from engine.entities.components import Position
             pos = self.world.get_component(victim, Position)
             if pos:
@@ -743,7 +1077,6 @@ class Engine:
         # Destroy entity
         self.world.destroy_entity(victim)
         # Award XP if killer has skills
-        killer_skills_comp = self.world.get_component(killer, type(killer).__class__) if False else None
         from engine.entities.components import Skills as SkillsComp
         killer_skills = self.world.get_component(killer, SkillsComp)
         if killer_skills is None:
@@ -755,9 +1088,16 @@ class Engine:
     # ---------- player actions ----------
 
     def move_player(self, dx: int, dy: int) -> bool:
+        """Move the player by (dx, dy). Returns True if the move succeeded.
+
+        If the destination tile has a hostile entity, an encounter is
+        triggered: ``pending_encounter_id`` is set so the REPL can show
+        the Mount-&-Blade-style encounter panel next tick. (Auto-attack
+        still fires from ``_auto_attack_hostiles`` if enabled.)
+        """
         if self.player is None or self.world_map is None:
             return False
-        from engine.entities.components import Position
+        from engine.entities.components import Position, Identity, Combat as CombatComp
         pos = self.world.get_component(self.player, Position)
         if pos is None:
             return False
@@ -765,31 +1105,33 @@ class Engine:
         tile = self.world_map.get_tile(new_x, new_y)
         if tile is None or not tile.is_walkable:
             return False
-        # Check for entity at destination — attack if hostile, block otherwise
-        for ent, (ep,) in self.world.view(Position):
+        # Check for entity at destination — spatial query (fast).
+        occupants = self.spatial.query_cell(new_x, new_y)
+        for ent in occupants:
             if ent.id == self.player.id:
                 continue
-            if ep.x == new_x and ep.y == new_y:
-                if self.world.has_tag(ent, "hostile"):
-                    weapon_id = self.world.get_component(self.player, type(self.player).__class__) if False else None
-                    from engine.entities.components import Combat as CombatComp
-                    combat_comp = self.world.get_component(self.player, CombatComp)
-                    weapon = None
-                    if combat_comp and combat_comp.weapon_id is not None:
-                        weapon = self.items.get(combat_comp.weapon_id)
-                    result = self.combat.attack(self.world, self.player, ent, weapon)
-                    if result.message:
-                        self.message_log.add(result.message, Color.YELLOW)
-                    if result.killed:
-                        self._handle_death(ent, self.player)
-                    return False
-                else:
-                    identity = self.world.get_component(ent, type(ent).__class__) if False else None
-                    from engine.entities.components import Identity
-                    identity = self.world.get_component(ent, Identity)
-                    name = identity.display_name if identity else f"entity#{ent.id}"
-                    self.message_log.add(f"{name} is in the way.", Color.GRAY)
-                    return False
+            # Pacified entities don't block / attack — they're friendly.
+            from engine.entities.components import Memory as MemoryComp
+            mem = self.world.get_component(ent, MemoryComp)
+            if mem and mem.knowledge.get("pacified_by_player"):
+                # Walk past them — they're a friend now.
+                identity = self.world.get_component(ent, Identity)
+                name = identity.display_name if identity else f"entity#{ent.id}"
+                self.message_log.add(f"You brush past {name}, your ally.", Color.GREEN)
+                continue
+            if self.world.has_tag(ent, "hostile"):
+                # Trigger the encounter panel — the player picks what to do.
+                self.pending_encounter_id = ent.id
+                identity = self.world.get_component(ent, Identity)
+                name = identity.display_name if identity else f"entity#{ent.id}"
+                self.message_log.add(f"You bump into {name}! (encounter)", Color.RED)
+                # If auto-attack is enabled, the engine will hit them this tick.
+                return False
+            else:
+                identity = self.world.get_component(ent, Identity)
+                name = identity.display_name if identity else f"entity#{ent.id}"
+                self.message_log.add(f"{name} is in the way.", Color.GRAY)
+                return False
         # Move
         self.spatial.update(self.player, new_x, new_y)
         pos.x = new_x
@@ -819,13 +1161,274 @@ class Engine:
             ("Skeleton", "s", Color.WHITE, 22, 8, 8),
         ])
         name, glyph, color, hp, strn, agi = creature
+        # Spawn near the player.
+        sx = pos.x + self.rng.randint(-3, 3)
+        sy = pos.y + self.rng.randint(-3, 3)
         e = self.factory.create_creature(
             name=name, glyph=glyph, color=color,
-            x=pos.x + self.rng.randint(-3, 3),
-            y=pos.y + self.rng.randint(-3, 3),
+            x=sx, y=sy,
             hp=hp, strength=strn, agility=agi, aggressive=True,
         )
+        # FIX: insert the creature into the spatial grid so the player can
+        # actually see and target it.
+        self.spatial.insert(e, sx, sy)
         self.message_log.add(f"A {name} appears!", Color.RED)
+        # If the creature spawned adjacent to the player, trigger the
+        # encounter panel so the player can choose how to react.
+        if max(abs(sx - pos.x), abs(sy - pos.y)) <= 1:
+            self.pending_encounter_id = e.id
+
+    # ---------- Bannerlord-style travel / follow / auto-attack ----------
+
+    def _auto_attack_hostiles(self) -> None:
+        """Auto-attack any adjacent hostile entity.
+
+        Called from ``tick_simulation`` when ``auto_attack_enabled`` is True.
+        Mirrors the bump-attack logic in ``move_player`` but runs every
+        tick so the player can keep up with faster NPCs. Skips pacified
+        entities (those with ``Memory.knowledge["pacified_by_player"]``).
+        """
+        if self.player is None:
+            return
+        from engine.entities.components import (
+            Position, Combat as CombatComp, Memory as MemoryComp,
+        )
+        pos = self.world.get_component(self.player, Position)
+        if pos is None:
+            return
+        combat_comp = self.world.get_component(self.player, CombatComp)
+        weapon = None
+        if combat_comp and combat_comp.weapon_id is not None:
+            weapon = self.items.get(combat_comp.weapon_id)
+        # Find adjacent hostiles via spatial query (radius 1.5 = 8-neighbourhood).
+        for ent, dist in self.spatial.query_radius(pos.x, pos.y, 1.5):
+            if ent.id == self.player.id:
+                continue
+            if dist > 1.5:
+                continue
+            if not self.world.has_tag(ent, "hostile"):
+                continue
+            # Skip pacified entities.
+            mem = self.world.get_component(ent, MemoryComp)
+            if mem and mem.knowledge.get("pacified_by_player"):
+                continue
+            # Skip if the entity is already dead.
+            health = self.world.get_component(ent, type(ent).__class__) if False else None
+            from engine.entities.components import Health
+            health = self.world.get_component(ent, Health)
+            if health is None or health.current <= 0:
+                continue
+            result = self.combat.attack(self.world, self.player, ent, weapon)
+            if result.message:
+                self.message_log.add(result.message, Color.YELLOW if result.hit else Color.GRAY)
+            if result.killed:
+                self._handle_death(ent, self.player)
+            # Only attack one hostile per tick — keeps combat turn-based
+            # and readable.
+            return
+
+    def _advance_travel(self) -> None:
+        """Walk the player one tile along the pending travel path, or one
+        step toward the follow target.
+
+        Called every tick from ``tick_simulation``. This is the engine
+        of the Mount-&-Blade-style overland travel: the player moves
+        automatically while the world (AI, needs, weather, economy)
+        keeps updating around them.
+        """
+        if self.player is None:
+            return
+        from engine.entities.components import Position
+        pos = self.world.get_component(self.player, Position)
+        if pos is None:
+            return
+        # ----- Follow target takes precedence -----
+        if self._follow_target_id is not None:
+            target = None
+            from engine.core.ecs import Entity as _E
+            for ent, (tp,) in self.world.view(Position):
+                if ent.id == self._follow_target_id:
+                    target = ent
+                    break
+            if target is None:
+                # Target died or was removed — stop following.
+                self._follow_target_id = None
+                self.message_log.add("You lose sight of your follow target.",
+                                     Color.GRAY)
+                return
+            tp = self.world.get_component(target, Position)
+            if tp is None:
+                self._follow_target_id = None
+                return
+            dx = tp.x - pos.x
+            dy = tp.y - pos.y
+            dist = max(abs(dx), abs(dy))
+            if dist <= 1:
+                # Caught up — stop following.
+                from engine.entities.components import Identity
+                identity = self.world.get_component(target, Identity)
+                name = identity.display_name if identity else f"entity#{target.id}"
+                self.message_log.add(f"You catch up to {name}.", Color.GREEN)
+                self._follow_target_id = None
+                return
+            # Step toward the target (Chebyshev normalization).
+            step_x = (1 if dx > 0 else -1 if dx < 0 else 0)
+            step_y = (1 if dy > 0 else -1 if dy < 0 else 0)
+            self.move_player(step_x, step_y)
+            return
+        # ----- Pending travel path -----
+        if not self._travel_path:
+            return
+        next_tile = self._travel_path[0]
+        nx, ny = next_tile
+        dx = nx - pos.x
+        dy = ny - pos.y
+        if dx == 0 and dy == 0:
+            # Reached this tile — pop and continue.
+            self._travel_path.pop(0)
+            if not self._travel_path:
+                self.message_log.add("You have arrived at your destination.",
+                                     Color.GREEN)
+            return
+        step_x = (1 if dx > 0 else -1 if dx < 0 else 0)
+        step_y = (1 if dy > 0 else -1 if dy < 0 else 0)
+        # If the move fails (e.g. an encounter triggered), abort the path
+        # so the player can react — they can re-issue `travel` after.
+        if not self.move_player(step_x, step_y):
+            if self.pending_encounter_id is not None:
+                # Encounter — pause travel.
+                self.message_log.add("Travel paused — encounter!", Color.YELLOW)
+                self._travel_path = []
+            else:
+                # Blocked — try to re-path around the obstacle.
+                self._travel_path.pop(0)
+                if not self._travel_path:
+                    self.message_log.add("Travel aborted — path blocked.",
+                                         Color.YELLOW)
+
+    def teleport_player(self, x: int, y: int) -> bool:
+        """Teleport the player to (x, y) instantly.
+
+        Used by the holy map's "travel here" function for fast travel.
+        Validates the destination is in-bounds and walkable.
+        """
+        if self.player is None or self.world_map is None:
+            return False
+        from engine.entities.components import Position
+        tile = self.world_map.get_tile(x, y)
+        if tile is None or not tile.is_walkable:
+            return False
+        pos = self.world.get_component(self.player, Position)
+        if pos is None:
+            return False
+        pos.x = x
+        pos.y = y
+        self.spatial.update(self.player, x, y)
+        # Cancel any in-progress travel / follow.
+        self._travel_path = []
+        self._follow_target_id = None
+        self._update_visibility()
+        self.message_log.add(f"You materialize at ({x}, {y}).", Color.CYAN)
+        return True
+
+    def travel_to(self, x: int, y: int) -> bool:
+        """Begin walking the player to (x, y) along an A* path.
+
+        The path is computed once and stored in ``_travel_path``. Each
+        subsequent tick, ``_advance_travel`` walks the player one tile
+        along the path while the world keeps simulating around them.
+        Returns True if a path was found.
+        """
+        if self.player is None or self.world_map is None or self.pathfinder is None:
+            return False
+        from engine.entities.components import Position
+        pos = self.world.get_component(self.player, Position)
+        if pos is None:
+            return False
+        # Validate destination.
+        tile = self.world_map.get_tile(x, y)
+        if tile is None or not tile.is_walkable:
+            self.message_log.add("Cannot travel there — terrain is impassable.",
+                                 Color.RED)
+            return False
+        path = self.pathfinder.find_path((pos.x, pos.y), (x, y), max_iterations=20000)
+        if not path or len(path) < 2:
+            self.message_log.add("No path to that destination.", Color.RED)
+            return False
+        # Drop the first tile (it's the player's current position).
+        self._travel_path = path[1:]
+        # Cancel any follow.
+        self._follow_target_id = None
+        self.message_log.add(
+            f"Travelling to ({x}, {y}) — {len(self._travel_path)} steps.",
+            Color.CYAN)
+        return True
+
+    def follow_entity(self, entity_id: int) -> bool:
+        """Begin following the entity with the given id.
+
+        Each tick, ``_advance_travel`` walks the player one step toward
+        the target's current position. Cleared when the player catches
+        up or the target dies.
+        """
+        if self.player is None:
+            return False
+        # Verify the entity exists.
+        from engine.entities.components import Position, Identity
+        target = None
+        for ent, (tp,) in self.world.view(Position):
+            if ent.id == entity_id:
+                target = ent
+                break
+        if target is None:
+            self.message_log.add("No such entity to follow.", Color.RED)
+            return False
+        self._follow_target_id = entity_id
+        # Cancel any pending travel path.
+        self._travel_path = []
+        identity = self.world.get_component(target, Identity)
+        name = identity.display_name if identity else f"entity#{entity_id}"
+        self.message_log.add(f"You begin following {name}.", Color.CYAN)
+        return True
+
+    def cancel_travel(self) -> None:
+        """Cancel any in-progress travel or follow."""
+        was_travelling = bool(self._travel_path) or self._follow_target_id is not None
+        self._travel_path = []
+        self._follow_target_id = None
+        if was_travelling:
+            self.message_log.add("Travel cancelled.", Color.YELLOW)
+
+    def befriend_entity(self, entity: Entity) -> bool:
+        """Mark an entity as pacified — it will never attack the player again.
+
+        Called by the ``give`` command when the player gives an item the
+        entity likes. Sets ``Memory.knowledge["pacified_by_player"]``,
+        removes the ``"hostile"`` tag, and switches the AI controller
+        to ``"wander"`` so the entity stops hunting the player.
+        """
+        from engine.entities.components import (
+            Memory as MemoryComp, AI as AIComp, Identity,
+        )
+        # Tag removal — neutralises bump-attack, auto-attack, and the
+        # _find_adjacent_hostile helper.
+        self.world.untag(entity, "hostile")
+        # Memory flag — neutralises the AI controllers' attack logic.
+        mem = self.world.get_component(entity, MemoryComp)
+        if mem is None:
+            mem = MemoryComp()
+            self.world.add_component(entity, mem)
+        mem.knowledge["pacified_by_player"] = 1.0
+        # Switch AI controller to wander so the entity stops hunting.
+        ai = self.world.get_component(entity, AIComp)
+        if ai:
+            ai.controller = "wander"
+            ai.target_id = None
+            ai.state = "idle"
+        identity = self.world.get_component(entity, Identity)
+        name = identity.display_name if identity else f"entity#{entity.id}"
+        self.message_log.add(f"{name} is now friendly toward you!", Color.GREEN)
+        return True
 
     # ---------- save/load ----------
 

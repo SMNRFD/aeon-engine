@@ -219,6 +219,26 @@ class GameREPL:
         # N to start a new game, or Q to quit.
         self._game_over: bool = False
 
+        # ----- encounter-panel state (Mount & Blade 2 style) -----
+        # When True, the player has encountered a hostile and must choose:
+        # run / attack / talk / trade / mercy / give. The simulation pauses
+        # (no tick) until the player picks an option.
+        self._in_encounter: bool = False
+        self._encounter_target: Optional[Entity] = None
+        # The options list — (key, label) pairs. Built when the encounter
+        # starts so the render can enumerate them.
+        self._encounter_options: list[tuple[str, str]] = []
+
+        # ----- holy-map state -----
+        # When True, the holy map (Bannerlord-style fullscreen world map)
+        # is shown instead of the normal layout. The player can pan, click
+        # to select a location, and choose to travel there.
+        self._in_holymap: bool = False
+        # Selected tile on the holy map (cursor position).
+        self._holymap_cursor: tuple[int, int] = (0, 0)
+        # Currently-selected POI / structure / kingdom info panel content.
+        self._holymap_info: Optional[str] = None
+
     # ----- terminal helpers ----------------------------------------------- #
 
     @staticmethod
@@ -600,6 +620,19 @@ class GameREPL:
         viewport_h = min(15, world_map.height)
         ox = pos.x - viewport_w // 2
         oy = pos.y - viewport_h // 2
+        # ----- FIX: use the spatial grid instead of a linear scan -----
+        # Query all entities in the viewport rectangle ONCE, build a (x,y)->entity
+        # dict, then dict-lookup per tile. This is O(viewport + nearby) instead
+        # of O(viewport × all_entities) per frame.
+        nearby_entities = self.engine.spatial.query_box(
+            ox, oy, ox + viewport_w - 1, oy + viewport_h - 1,
+        )
+        entity_at: dict[tuple[int, int], Entity] = {}
+        for ent in nearby_entities:
+            ep = self.engine.world.get_component(ent, Position)
+            if ep is None:
+                continue
+            entity_at[(ep.x, ep.y)] = ent
         lines: list[Text] = []
         for j in range(viewport_h):
             row = Text()
@@ -613,20 +646,33 @@ class GameREPL:
                 if not tile.is_explored and not self.engine.cheat_mode:
                     row.append(" ")
                     continue
-                entity_here = False
-                for ent, (ep,) in self.engine.world.view(Position):
-                    if ep.x == wx and ep.y == wy:
-                        if ent.id == player.id:
-                            row.append("@", style="bold yellow")
-                            entity_here = True
-                            break
+                ent = entity_at.get((wx, wy))
+                if ent is not None:
+                    if ent.id == player.id:
+                        row.append("@", style="bold yellow")
+                    else:
                         identity = self.engine.world.get_component(ent, Identity)
                         glyph = identity.glyph if identity else "?"
-                        color = "red" if self.engine.world.has_tag(ent, "hostile") else "white"
+                        # Pacified entities show in green; hostiles in red; others white.
+                        from engine.entities.components import Memory as MemoryComp
+                        mem = self.engine.world.get_component(ent, MemoryComp)
+                        if mem and mem.knowledge.get("pacified_by_player"):
+                            color = "green"
+                        elif self.engine.world.has_tag(ent, "hostile"):
+                            color = "red"
+                        else:
+                            color = "white"
                         row.append(glyph, style=color)
-                        entity_here = True
-                        break
-                if not entity_here:
+                else:
+                    # Show structure glyph if a structure is on this tile.
+                    if tile.structure_id is not None:
+                        placement = self.engine.structure_placements.get(tile.structure_id)
+                        if placement is not None:
+                            from engine.structures.system import StructureLibrary
+                            arch = StructureLibrary.get(placement.structure_type)
+                            if arch:
+                                row.append(arch.glyph, style="yellow")
+                                continue
                     row.append(tile.terrain.glyph)
             lines.append(row)
         return Panel(Group(*lines), title="[bold]Map[/]", border_style="cyan", expand=True)
@@ -667,6 +713,10 @@ class GameREPL:
 
     def _render(self) -> None:
         """Render the full game UI."""
+        # Holy map takes over the whole screen.
+        if self._in_holymap:
+            self._render_holymap()
+            return
         self.console.clear()
         # Banner always visible at top.
         self.console.print(self._banner_panel())
@@ -691,8 +741,11 @@ class GameREPL:
         # Dialogue overlay if active.
         if self._in_dialogue:
             self._render_dialogue()
+        # Encounter panel overlay (Mount & Blade 2 style).
+        if self._in_encounter:
+            self._render_encounter()
         # Prompt.
-        if self._in_dialogue:
+        if self._in_dialogue or self._in_encounter:
             self.console.print("[bold yellow]Choice>[/] ", end="")
         else:
             self.console.print("[bold green]>[/] ", end="")
@@ -736,17 +789,27 @@ class GameREPL:
         if tile:
             biome_name = tile.biome_type.replace("_", " ").title()
             body_lines.append(Text(f"Terrain: {tile.terrain.glyph} {biome_name}", style="dim"))
+            # Mention any structure on this tile.
+            if tile.structure_id is not None:
+                placement = self.engine.structure_placements.get(tile.structure_id)
+                if placement is not None:
+                    body_lines.append(Text(
+                        f"Structure: {placement.name} (here)", style="yellow"))
         any_entity = False
-        for ent, (ep,) in self.engine.world.view(Position):
+        # FIX: use the spatial grid to find nearby entities (radius 12)
+        # instead of a linear scan over all entities.
+        from engine.entities.components import Memory as MemoryComp
+        for ent, dist in self.engine.spatial.query_radius(pos.x, pos.y, 12):
             if ent.id == player.id:
-                continue
-            dist = max(abs(ep.x - pos.x), abs(ep.y - pos.y))
-            if dist > 12:
                 continue
             identity = self.engine.world.get_component(ent, Identity)
             name = identity.display_name if identity else f"entity#{ent.id}"
             glyph = identity.glyph if identity else "?"
-            if self.engine.world.has_tag(ent, "hostile"):
+            mem = self.engine.world.get_component(ent, MemoryComp)
+            if mem and mem.knowledge.get("pacified_by_player"):
+                style = "green"
+                tag = " (friendly)"
+            elif self.engine.world.has_tag(ent, "hostile"):
                 style = "red"
                 tag = " (hostile)"
             elif self.engine.world.has_tag(ent, "npc"):
@@ -755,8 +818,10 @@ class GameREPL:
             else:
                 style = "white"
                 tag = ""
-            body_lines.append(Text(f"{glyph} {name}{tag} at ({ep.x}, {ep.y}) — dist {dist}",
-                                   style=style))
+            ep = self.engine.world.get_component(ent, Position)
+            body_lines.append(Text(
+                f"{glyph} {name}{tag} at ({ep.x}, {ep.y}) — dist {int(dist)}",
+                style=style))
             any_entity = True
         if not any_entity:
             body_lines.append(Text("Nothing of interest nearby.", style="dim"))
@@ -987,6 +1052,20 @@ class GameREPL:
                         if old:
                             inv.add(old, 1)
                     comp.weapon_id = item.id
+                    # DUAL-WRITE: also store in Inventory._equipment so the
+                    # inventory display shows the equipped weapon. This is
+                    # the fix for the "equipped items not shown in inventory" bug.
+                    from engine.inventory.inventory import EquipmentSlot
+                    # Decide main-hand vs off-hand: if main-hand is empty,
+                    # use it; otherwise use off-hand (dual wielding).
+                    if inv._equipment[EquipmentSlot.MAIN_HAND] is None:
+                        inv._equipment[EquipmentSlot.MAIN_HAND] = item.id
+                    else:
+                        # Swap: move current main-hand to off-hand, new weapon to main-hand.
+                        old_main_id = inv._equipment[EquipmentSlot.MAIN_HAND]
+                        if old_main_id is not None and inv._equipment[EquipmentSlot.OFF_HAND] is None:
+                            inv._equipment[EquipmentSlot.OFF_HAND] = old_main_id
+                        inv._equipment[EquipmentSlot.MAIN_HAND] = item.id
                     self.msg(f"You equip {item.display_name}.", Color.GREEN)
                     return
                 elif item.category == "armor":
@@ -994,7 +1073,24 @@ class GameREPL:
                     if comp is None:
                         comp = CombatComp()
                         self.engine.world.add_component(self.engine.player, comp)
-                    slot_name = "chest"
+                    # Determine the equipment slot from the item's "slot" property.
+                    # 0=chest, 1=head, 2=legs, 3=feet, 4=finger, 5=neck.
+                    # Special-case shields (off-hand), cloaks, boots by name.
+                    from engine.inventory.inventory import (
+                        EquipmentSlot, SLOT_PROPERTY_MAP,
+                    )
+                    slot_prop = item.properties.get("slot")
+                    equip_slot = EquipmentSlot.CHEST  # default
+                    if slot_prop is not None:
+                        slot_value = int(slot_prop.value)
+                        equip_slot = SLOT_PROPERTY_MAP.get(slot_value, EquipmentSlot.CHEST)
+                    elif "shield" in item.name.lower():
+                        equip_slot = EquipmentSlot.OFF_HAND
+                    elif "cloak" in item.name.lower():
+                        equip_slot = EquipmentSlot.CLOAK
+                    elif "boot" in item.name.lower():
+                        equip_slot = EquipmentSlot.FEET
+                    slot_name = equip_slot.value
                     inv.remove(item.id, 1)
                     old_id = comp.armor_ids.get(slot_name)
                     if old_id is not None:
@@ -1002,6 +1098,10 @@ class GameREPL:
                         if old:
                             inv.add(old, 1)
                     comp.armor_ids[slot_name] = item.id
+                    # DUAL-WRITE: also store in Inventory._equipment so the
+                    # inventory display shows the equipped armor. This is
+                    # the fix for the "equipped items not shown in inventory" bug.
+                    inv._equipment[equip_slot] = item.id
                     self.msg(f"You equip {item.display_name}.", Color.GREEN)
                     return
                 else:
@@ -1068,15 +1168,20 @@ class GameREPL:
             self.msg("There's nothing to pick up.", Color.GRAY)
 
     def cmd_unequip(self, args: list[str]) -> None:
+        """Unequip a slot (or all slots). Dual-writes the clear to both
+        ``Combat.weapon_id``/``Combat.armor_ids`` and ``Inventory._equipment``
+        so the inventory display stays in sync."""
+        from engine.inventory.inventory import EquipmentSlot
         comp = (self.engine.world.get_component(self.engine.player, CombatComp)
                 if self.engine.player else None)
+        inv = (self.engine.inventories.get(self.engine.player.id)
+               if self.engine.player else None)
         if comp is None:
             self.set_output(Text("You have nothing equipped.", style="dim"),
                             title="Unequip")
             return
         if not args:
             unequipped = False
-            inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
             for slot, item_id in list(comp.armor_ids.items()):
                 if item_id is not None and inv:
                     item = self.engine.items.get(item_id)
@@ -1090,6 +1195,10 @@ class GameREPL:
                     inv.add(item, 1)
                     unequipped = True
                 comp.weapon_id = None
+            # Clear all equipment slots in Inventory._equipment too.
+            if inv:
+                for slot in EquipmentSlot:
+                    inv._equipment[slot] = None
             if unequipped:
                 self.msg("You unequip all items.", Color.GREEN)
             else:
@@ -1097,33 +1206,61 @@ class GameREPL:
                                 title="Unequip")
             return
         slot_name = args[0].lower()
-        if slot_name in ("weapon", "main_hand", "hand"):
-            if comp.weapon_id is not None:
-                inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
+        if slot_name in ("weapon", "main_hand", "hand", "off_hand", "shield"):
+            equip_slot = (EquipmentSlot.OFF_HAND if slot_name in ("off_hand", "shield")
+                          else EquipmentSlot.MAIN_HAND)
+            item_id = (comp.weapon_id if equip_slot == EquipmentSlot.MAIN_HAND
+                       else comp.armor_ids.get("off_hand"))
+            if item_id is not None:
                 if inv:
-                    item = self.engine.items.get(comp.weapon_id)
+                    item = self.engine.items.get(item_id)
                     if item:
                         inv.add(item, 1)
                         self.msg(f"You unequip {item.display_name}.", Color.GREEN)
+                if equip_slot == EquipmentSlot.MAIN_HAND:
                     comp.weapon_id = None
-            else:
-                self.set_output(Text("You don't have a weapon equipped.", style="dim"),
-                                title="Unequip")
-        elif slot_name in ("chest", "armor", "body"):
-            if comp.armor_ids.get("chest") is not None:
-                inv = self.engine.inventories.get(self.engine.player.id) if self.engine.player else None
+                else:
+                    comp.armor_ids["off_hand"] = None
                 if inv:
-                    item = self.engine.items.get(comp.armor_ids["chest"])
+                    inv._equipment[equip_slot] = None
+            else:
+                self.set_output(Text("You don't have a weapon equipped there.",
+                                     style="dim"), title="Unequip")
+        elif slot_name in ("chest", "armor", "body", "head", "helmet",
+                            "legs", "feet", "boots", "hands", "cloak",
+                            "neck", "amulet", "ring", "finger"):
+            # Map common slot names to EquipmentSlot.
+            slot_map = {
+                "chest": EquipmentSlot.CHEST, "armor": EquipmentSlot.CHEST,
+                "body": EquipmentSlot.CHEST,
+                "head": EquipmentSlot.HEAD, "helmet": EquipmentSlot.HEAD,
+                "legs": EquipmentSlot.LEGS,
+                "feet": EquipmentSlot.FEET, "boots": EquipmentSlot.FEET,
+                "hands": EquipmentSlot.HANDS,
+                "cloak": EquipmentSlot.CLOAK,
+                "neck": EquipmentSlot.NECK, "amulet": EquipmentSlot.NECK,
+                "ring": EquipmentSlot.FINGER_LEFT, "finger": EquipmentSlot.FINGER_LEFT,
+            }
+            equip_slot = slot_map.get(slot_name, EquipmentSlot.CHEST)
+            slot_key = equip_slot.value
+            item_id = comp.armor_ids.get(slot_key)
+            if item_id is not None:
+                if inv:
+                    item = self.engine.items.get(item_id)
                     if item:
                         inv.add(item, 1)
                         self.msg(f"You unequip {item.display_name}.", Color.GREEN)
-                    comp.armor_ids["chest"] = None
+                comp.armor_ids[slot_key] = None
+                if inv:
+                    inv._equipment[equip_slot] = None
             else:
-                self.set_output(Text("You don't have chest armor equipped.",
+                self.set_output(Text(f"You don't have anything equipped in {slot_name}.",
                                      style="dim"), title="Unequip")
         else:
-            self.set_output(Text(f"Unknown slot: {slot_name}\nValid slots: weapon, chest",
-                                 style="dim"), title="Unequip")
+            self.set_output(Text(
+                f"Unknown slot: {slot_name}\nValid slots: weapon, off_hand, "
+                "chest, head, legs, feet, hands, cloak, neck, ring",
+                style="dim"), title="Unequip")
 
     # ----- dialogue & trade ----------------------------------------------- #
 
@@ -1440,6 +1577,17 @@ class GameREPL:
             ("Locale", "locale [code]"),
             ("System", "save [name]; load <name>; plugins; help (?); banner; respawn; "
                          "new_game; memory [npc]; schedule; Quit (q)"),
+            ("Mount&Blade 2", "autoattack [on|off] (aa) — auto-fight adjacent hostiles; "
+                              "give <item> — befriend an enemy by giving them a gift they like "
+                              "(skeletons like bones, bandits like coins, wolves like meat); "
+                              "travelto <x> <y> | travelto settlement <name> | travelto cancel — "
+                              "Bannerlord-style overland travel (world keeps simulating); "
+                              "follow <name> — pursue an NPC/creature/enemy; "
+                              "holymap (holy) — fullscreen world map with kingdoms/villages/castles "
+                              "(subcommands: holymap travel <x> <y>; holymap info <x> <y>; "
+                              "holymap settlement <id>; holymap teleport <x> <y>; holymap close); "
+                              "when you meet a hostile, an encounter panel opens with: "
+                              "1=Attack 2=Talk 3=Trade 4=Give 5=Mercy 6=Run 0=Close"),
         ]
         for cat, lines in categories:
             table.add_row(cat, lines)
@@ -1448,6 +1596,656 @@ class GameREPL:
     def cmd_banner(self, args: list[str]) -> None:
         """Show the welcome banner as a persistent panel."""
         self.set_output(self._banner_panel().renderable, title="Aeon Engine")
+
+    # ----- Mount & Blade 2 style: encounter panel ------------------------ #
+
+    def _start_encounter(self, target: Entity) -> None:
+        """Open the encounter panel for the given hostile target.
+
+        Builds the option list (run / attack / talk / trade / mercy / give)
+        and sets ``_in_encounter = True``. The simulation pauses (no tick)
+        until the player picks an option or flees.
+        """
+        self._encounter_target = target
+        self._in_encounter = True
+        # Build the option list. Each option is (key, label).
+        self._encounter_options = [
+            ("1", "Attack"),
+            ("2", "Talk"),
+            ("3", "Trade"),
+            ("4", "Give (befriend)"),
+            ("5", "Mercy (spare)"),
+            ("6", "Run (flee)"),
+            ("0", "Close panel"),
+        ]
+        identity = self.engine.world.get_component(target, Identity)
+        name = identity.display_name if identity else f"entity#{target.id}"
+        health = self.engine.world.get_component(target, Health)
+        hp_str = f"{health.current}/{health.maximum}" if health else "?"
+        self.msg(f"Encounter: {name} (HP {hp_str}) — choose an action.",
+                 Color.RED)
+
+    def _render_encounter(self) -> None:
+        """Render the encounter panel — Mount & Blade 2 style (static mode)."""
+        panel = self._encounter_panel_renderable()
+        if panel is not None:
+            self.console.print(panel)
+        self.console.print("[bold yellow]Choice>[/] ", end="")
+
+    def _encounter_panel_renderable(self) -> Optional[Panel]:
+        """Return the encounter panel as a renderable (for both static and
+        live mode)."""
+        if self._encounter_target is None:
+            return None
+        target = self._encounter_target
+        identity = self.engine.world.get_component(target, Identity)
+        name = identity.display_name if identity else f"entity#{target.id}"
+        health = self.engine.world.get_component(target, Health)
+        hp_str = f"{health.current}/{health.maximum}" if health else "?"
+        body = Text()
+        body.append("\n")
+        body.append("╔══════════════════════════════════════════════════════════╗\n",
+                    style="bold red")
+        body.append("║              E N C O U N T E R                          ║\n",
+                    style="bold red")
+        body.append("╚══════════════════════════════════════════════════════════╝\n",
+                    style="bold red")
+        body.append("\n")
+        body.append(f"  You are face-to-face with: {name}\n", style="bold white")
+        body.append(f"  HP: {hp_str}\n\n", style="red")
+        body.append("  Choose your action:\n\n", style="yellow")
+        for key, label in self._encounter_options:
+            body.append(f"    [{key}]  {label}\n", style="white")
+        body.append("\n  Type a number, or 'give <item>' to offer a gift.\n",
+                    style="dim")
+        return Panel(body, title=f"[bold red]Encounter — {name}[/]",
+                     border_style="red", expand=True)
+
+    def _handle_encounter_input(self, line: str) -> bool:
+        """Handle a line of input while the encounter panel is open.
+
+        Returns True if the input was consumed (the caller should not
+        execute it as a command).
+        """
+        if not self._in_encounter:
+            return False
+        line = line.strip()
+        if not line:
+            return True
+        # Map keys to actions.
+        action_map = {
+            "1": "attack", "2": "talk", "3": "trade",
+            "4": "give", "5": "mercy", "6": "run",
+            "0": "close",
+        }
+        action = action_map.get(line, line.lower())
+        target = self._encounter_target
+        # Validate the target is still alive.
+        if target is None or not self.engine.world.is_alive(target):
+            self.msg("Your opponent is gone.", Color.GRAY)
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action == "attack":
+            self.cmd_attack([self._target_name(target)])
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action == "talk":
+            self.cmd_talk([self._target_name(target)])
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action == "trade":
+            self.cmd_trade([self._target_name(target)])
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action == "give":
+            # Stay in the encounter panel — the player types the item name next.
+            self.msg("Type 'give <item>' to offer an item (e.g. 'give bone').",
+                     Color.YELLOW)
+            return True
+        if action == "mercy":
+            # Spare the target: pacify it without giving an item.
+            self.engine.befriend_entity(target)
+            self.msg(f"You spare {self._target_name(target)}'s life. They are now friendly.",
+                     Color.GREEN)
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action == "run":
+            # Flee: move the player a few tiles away from the target.
+            self._flee_from(target)
+            self._in_encounter = False
+            self._encounter_target = None
+            return True
+        if action in ("close", "q", "quit", "exit"):
+            self._in_encounter = False
+            self._encounter_target = None
+            self.msg("You step back from the encounter.", Color.GRAY)
+            return True
+        # If the player typed a `give <item>` command while in the encounter,
+        # handle it.
+        if line.lower().startswith("give "):
+            self.cmd_give(line.split()[1:])
+            # Check if the target was befriended — if so, close the panel.
+            from engine.entities.components import Memory as MemoryComp
+            mem = self.engine.world.get_component(target, MemoryComp)
+            if mem and mem.knowledge.get("pacified_by_player"):
+                self._in_encounter = False
+                self._encounter_target = None
+            return True
+        self.msg(f"Unknown choice: {line}. Try 1-6 or 0.", Color.RED)
+        return True
+
+    def _target_name(self, target: Entity) -> str:
+        identity = self.engine.world.get_component(target, Identity)
+        return identity.display_name if identity else f"entity#{target.id}"
+
+    def _check_pending_encounter(self) -> None:
+        """Check if the engine has detected a hostile encounter and open
+        the encounter panel if so. Called after every tick.
+
+        This is the bridge between ``Engine.pending_encounter_id`` (set by
+        ``move_player`` on a hostile bump) and the encounter panel UI.
+        """
+        pid = getattr(self.engine, "pending_encounter_id", None)
+        if pid is None:
+            return
+        # Clear the pending flag.
+        self.engine.pending_encounter_id = None
+        # Don't open if we're already in an encounter or dialogue.
+        if self._in_encounter or self._in_dialogue:
+            return
+        # Don't open if the player is dead.
+        if getattr(self.engine, "player_dead", False):
+            return
+        # Find the entity by id.
+        target = None
+        for ent, (ep,) in self.engine.world.view(Position):
+            if ent.id == pid:
+                target = ent
+                break
+        if target is None or not self.engine.world.is_alive(target):
+            return
+        # Only open for hostile entities (not pacified ones).
+        if not self.engine.world.has_tag(target, "hostile"):
+            return
+        from engine.entities.components import Memory as MemoryComp
+        mem = self.engine.world.get_component(target, MemoryComp)
+        if mem and mem.knowledge.get("pacified_by_player"):
+            return
+        self._start_encounter(target)
+
+    def _flee_from(self, target: Entity) -> None:
+        """Move the player a few tiles away from the target."""
+        if self.engine.player is None:
+            return
+        player_pos = self.engine.world.get_component(self.engine.player, Position)
+        target_pos = self.engine.world.get_component(target, Position)
+        if player_pos is None or target_pos is None:
+            return
+        # Step directly away from the target.
+        dx = (1 if player_pos.x > target_pos.x else -1 if player_pos.x < target_pos.x else 0)
+        dy = (1 if player_pos.y > target_pos.y else -1 if player_pos.y < target_pos.y else 0)
+        # If we'd step into the target, pick a perpendicular direction.
+        if dx == 0 and dy == 0:
+            dx, dy = 1, 0
+        for _ in range(3):
+            if not self.engine.move_player(dx, dy):
+                break
+        self.msg("You flee from the encounter!", Color.YELLOW)
+
+    # ----- give command (befriend enemies) -------------------------------- #
+
+    def cmd_give(self, args: list[str]) -> None:
+        """Give an item to an adjacent entity.
+
+        If the entity likes the item (per GIFT_PREFERENCES), it becomes
+        friendly and will never attack the player again. Otherwise the
+        item is still transferred (a gift is a gift).
+        """
+        if not args:
+            self.set_output(Text(
+                "Give what? Try: give bone   (to an adjacent hostile)",
+                style="dim"), title="Give")
+            return
+        item_name = " ".join(args).lower()
+        # Determine the target — either the encounter target, an adjacent
+        # hostile, or an adjacent NPC.
+        target = None
+        if self._in_encounter and self._encounter_target is not None:
+            target = self._encounter_target
+        else:
+            target = self._find_adjacent_hostile()
+            if target is None:
+                target = self._find_adjacent_npc()
+        if target is None:
+            self.set_output(Text("There's no one to give to.", style="dim"),
+                            title="Give")
+            return
+        inv = self.engine.inventories.get(self.engine.player.id)
+        if inv is None:
+            return
+        # Find the item in the backpack.
+        item_to_give = None
+        for slot_idx, item, count in inv.iter_items(self.engine.items):
+            if item_name in item.display_name.lower() or item_name in item.name.lower():
+                item_to_give = item
+                break
+        if item_to_give is None:
+            self.set_output(Text(f"You don't have any '{item_name}'.", style="red"),
+                            title="Give")
+            return
+        # Remove the item from the player's inventory.
+        inv.remove(item_to_give.id, 1)
+        target_identity = self.engine.world.get_component(target, Identity)
+        target_name = target_identity.display_name if target_identity else f"entity#{target.id}"
+        self.msg(f"You give {item_to_give.display_name} to {target_name}.",
+                 Color.YELLOW)
+        # Check if the target likes this item.
+        from engine.items.generator import GIFT_PREFERENCES
+        target_name_lower = target_name.lower()
+        liked = False
+        for creature_name, liked_items in GIFT_PREFERENCES.items():
+            if creature_name in target_name_lower:
+                if item_to_give.base_type in liked_items:
+                    liked = True
+                    break
+        if liked:
+            self.msg(f"{target_name} is delighted! They are now your friend.",
+                     Color.GREEN)
+            self.engine.befriend_entity(target)
+        else:
+            self.msg(f"{target_name} accepts the gift but seems unimpressed.",
+                     Color.GRAY)
+
+    # ----- auto-attack toggle --------------------------------------------- #
+
+    def cmd_autoattack(self, args: list[str]) -> None:
+        """Toggle auto-attack on/off.
+
+        When enabled, the engine auto-attacks adjacent hostiles each tick,
+        so the player doesn't have to type 'attack' faster than the AI.
+        """
+        if args and args[0].lower() in ("on", "true", "1", "yes"):
+            self.engine.auto_attack_enabled = True
+        elif args and args[0].lower() in ("off", "false", "0", "no"):
+            self.engine.auto_attack_enabled = False
+        else:
+            # Toggle.
+            self.engine.auto_attack_enabled = not self.engine.auto_attack_enabled
+        state = "ON" if self.engine.auto_attack_enabled else "OFF"
+        color = Color.GREEN if self.engine.auto_attack_enabled else Color.GRAY
+        self.msg(f"Auto-attack: {state}", color)
+        self.set_output(Text(
+            f"Auto-attack is now {state}.\n"
+            + ("The engine will automatically attack adjacent hostiles each tick."
+               if self.engine.auto_attack_enabled
+               else "You must manually type 'attack' to fight."),
+            style="green" if self.engine.auto_attack_enabled else "dim"),
+            title="Auto-Attack")
+
+    # ----- travel / follow commands --------------------------------------- #
+
+    def cmd_travelto(self, args: list[str]) -> None:
+        """Travel to a map coordinate (Mount & Blade 2 style).
+
+        Usage:
+            travelto <x> <y>           — walk to (x, y) along an A* path
+            travelto settlement <name> — walk to a named settlement
+            travelto cancel            — abort the current journey
+        """
+        if not args:
+            self.set_output(Text(
+                "Usage:\n"
+                "  travelto <x> <y>           — walk to coordinates\n"
+                "  travelto settlement <name> — walk to a named settlement\n"
+                "  travelto cancel            — abort the journey",
+                style="dim"), title="Travel")
+            return
+        if args[0].lower() == "cancel":
+            self.engine.cancel_travel()
+            return
+        if args[0].lower() == "settlement" and len(args) >= 2:
+            name = " ".join(args[1:]).lower()
+            # Find a settlement by name.
+            for sx, sy, sname in self.engine.settlements:
+                if name in sname.lower():
+                    ok = self.engine.travel_to(sx, sy)
+                    if ok:
+                        self.set_output(Text(
+                            f"Travelling to {sname} at ({sx}, {sy}).",
+                            style="cyan"), title="Travel")
+                    return
+            self.set_output(Text(f"No settlement named '{name}'.", style="red"),
+                            title="Travel")
+            return
+        if len(args) >= 2:
+            try:
+                x, y = int(args[0]), int(args[1])
+            except ValueError:
+                self.set_output(Text("Coordinates must be integers.", style="red"),
+                                title="Travel")
+                return
+            ok = self.engine.travel_to(x, y)
+            if ok:
+                self.set_output(Text(
+                    f"Travelling to ({x}, {y}) — {len(self.engine._travel_path)} steps.\n"
+                    "The world keeps simulating while you travel. Type 'travelto cancel' to abort.",
+                    style="cyan"), title="Travel")
+            return
+        self.set_output(Text("Usage: travelto <x> <y>", style="dim"),
+                        title="Travel")
+
+    def cmd_follow(self, args: list[str]) -> None:
+        """Follow an NPC / creature / enemy by name.
+
+        The player will automatically walk toward the target each tick
+        until they catch up (or the target dies).
+        """
+        if not args:
+            self.set_output(Text(
+                "Follow whom? Try: follow goblin   (or any nearby entity name)",
+                style="dim"), title="Follow")
+            return
+        target = self._find_entity_by_name(" ".join(args))
+        if target is None:
+            self.set_output(Text(
+                f"You don't see any '{' '.join(args)}' nearby.", style="red"),
+                title="Follow")
+            return
+        ok = self.engine.follow_entity(target.id)
+        if ok:
+            self.set_output(Text(
+                f"Following {self._target_name(target)}. Type 'travelto cancel' to stop.",
+                style="cyan"), title="Follow")
+
+    # ----- holy map (Bannerlord-style fullscreen world map) -------------- #
+
+    def cmd_holymap(self, args: list[str]) -> None:
+        """Open the holy map — a fullscreen world overview.
+
+        Shows the entire world (downsampled to fit), with:
+          * @ for the player's current position
+          * ⌂ for settlements (villages)
+          * ⚰ for castles
+          * colored backgrounds for kingdom territories
+          * bookmarks / pins / markers
+
+        Subcommands:
+            holymap                  — open the map (toggle)
+            holymap close            — close the map
+            holymap travel <x> <y>   — travel to a coordinate
+            holymap info <x> <y>     — show info about a tile
+            holymap settlement <id>  — show info about a settlement by index
+        """
+        if not args:
+            # Toggle the holy map view.
+            self._in_holymap = not self._in_holymap
+            if self._in_holymap:
+                # Center the cursor on the player.
+                if self.engine.player is not None:
+                    pos = self.engine.world.get_component(self.engine.player, Position)
+                    if pos is not None:
+                        self._holymap_cursor = (pos.x, pos.y)
+                self.msg("Holy map opened. Type 'holymap close' to close.",
+                         Color.CYAN)
+            else:
+                self.msg("Holy map closed.", Color.GRAY)
+            return
+        sub = args[0].lower()
+        if sub == "close":
+            self._in_holymap = False
+            self.msg("Holy map closed.", Color.GRAY)
+            return
+        if sub == "travel" and len(args) >= 3:
+            try:
+                x, y = int(args[1]), int(args[2])
+            except ValueError:
+                self.set_output(Text("Coordinates must be integers.", style="red"),
+                                title="Holy Map")
+                return
+            ok = self.engine.travel_to(x, y)
+            if ok:
+                self.set_output(Text(
+                    f"Travelling to ({x}, {y}) — {len(self.engine._travel_path)} steps.",
+                    style="cyan"), title="Holy Map — Travel")
+            return
+        if sub == "info" and len(args) >= 3:
+            try:
+                x, y = int(args[1]), int(args[2])
+            except ValueError:
+                self.set_output(Text("Coordinates must be integers.", style="red"),
+                                title="Holy Map")
+                return
+            info = self._holymap_tile_info(x, y)
+            self.set_output(Text(info, style="white"), title=f"Holy Map — ({x}, {y})")
+            return
+        if sub == "settlement" and len(args) >= 2:
+            try:
+                idx = int(args[1])
+            except ValueError:
+                self.set_output(Text("Settlement index must be an integer.", style="red"),
+                                title="Holy Map")
+                return
+            if 1 <= idx <= len(self.engine.settlements):
+                sx, sy, sname = self.engine.settlements[idx - 1]
+                info = self._holymap_tile_info(sx, sy)
+                self.set_output(Text(info, style="white"),
+                                title=f"Holy Map — {sname}")
+            else:
+                self.set_output(Text(
+                    f"Invalid index. Range: 1..{len(self.engine.settlements)}",
+                    style="red"), title="Holy Map")
+            return
+        if sub == "teleport" and len(args) >= 3:
+            # Cheat / fast-travel: instantly teleport.
+            try:
+                x, y = int(args[1]), int(args[2])
+            except ValueError:
+                self.set_output(Text("Coordinates must be integers.", style="red"),
+                                title="Holy Map")
+                return
+            ok = self.engine.teleport_player(x, y)
+            if ok:
+                self.set_output(Text(f"Teleported to ({x}, {y}).", style="cyan"),
+                                title="Holy Map — Teleport")
+            else:
+                self.set_output(Text("Cannot teleport there.", style="red"),
+                                title="Holy Map")
+            return
+        self.set_output(Text(
+            "Usage:\n"
+            "  holymap                       — open/close the map\n"
+            "  holymap close                 — close the map\n"
+            "  holymap travel <x> <y>        — travel to a coordinate\n"
+            "  holymap teleport <x> <y>      — instantly teleport (debug)\n"
+            "  holymap info <x> <y>          — show info about a tile\n"
+            "  holymap settlement <index>    — show info about a settlement",
+            style="dim"), title="Holy Map")
+
+    def _holymap_tile_info(self, x: int, y: int) -> str:
+        """Build a human-readable info string for the tile at (x, y)."""
+        if self.engine.world_map is None:
+            return "No world map."
+        tile = self.engine.world_map.get_tile(x, y)
+        if tile is None:
+            return f"({x}, {y}) is out of bounds."
+        lines = [f"Position: ({x}, {y})"]
+        lines.append(f"Terrain: {tile.terrain.glyph} {tile.terrain.terrain_type.value}")
+        lines.append(f"Biome: {tile.biome_type.replace('_', ' ').title()}")
+        lines.append(f"Elevation: {tile.elevation:+.2f}")
+        lines.append(f"Temperature: {tile.temperature:.1f}°C")
+        lines.append(f"Moisture: {tile.moisture:.0%}")
+        lines.append(f"Walkable: {tile.is_walkable}")
+        # Structure on this tile?
+        if tile.structure_id is not None:
+            placement = self.engine.structure_placements.get(tile.structure_id)
+            if placement is not None:
+                from engine.structures.system import StructureLibrary
+                arch = StructureLibrary.get(placement.structure_type)
+                stype = arch.name if arch else "Unknown"
+                lines.append(f"Structure: {placement.name} ({stype})")
+                lines.append(f"  Description: {placement.description or 'n/a'}")
+        # Settlement at this tile?
+        for sx, sy, sname in self.engine.settlements:
+            if sx == x and sy == y:
+                lines.append(f"Settlement: {sname}")
+                # Which kingdom owns it?
+                from engine.kingdoms.system import KingdomLibrary
+                for k in KingdomLibrary.all():
+                    if k.capital_territory_id is not None:
+                        # Capital territory is at this settlement.
+                        ks = getattr(self.engine, "_kingdom_system", None)
+                        if ks is not None:
+                            territory = ks.territory(k.capital_territory_id)
+                            if territory and territory.location == (x, y):
+                                lines.append(f"  Capital of: {k.name}")
+                break
+        # Map markers at this tile?
+        bm = getattr(self.engine, "_bookmarks_mgr", None)
+        if bm is not None:
+            markers = bm.markers_at(x, y)
+            if markers:
+                lines.append("Markers:")
+                for m in markers:
+                    lines.append(f"  {m.icon} {m.name} ({m.marker_type})")
+                    if m.description:
+                        lines.append(f"    {m.description}")
+        # Adjacent entities (within 3 tiles)?
+        nearby = self.engine.spatial.query_radius(x, y, 3)
+        if nearby:
+            lines.append("Nearby entities:")
+            for ent, dist in nearby[:5]:  # top 5
+                identity = self.engine.world.get_component(ent, Identity)
+                name = identity.display_name if identity else f"entity#{ent.id}"
+                tag = ""
+                if self.engine.world.has_tag(ent, "hostile"):
+                    tag = " (hostile)"
+                elif self.engine.world.has_tag(ent, "npc"):
+                    tag = " (NPC)"
+                lines.append(f"  {name}{tag} (dist {int(dist)})")
+        return "\n".join(lines)
+
+    def _render_holymap_panel(self) -> Panel:
+        """Render the holy map as a fullscreen ASCII overview.
+
+        The world is downsampled to fit the terminal — each cell represents
+        one tile (or more for very large worlds). Symbols:
+          @ — player
+          ⌂ — settlement (village)
+          ⚰ — castle
+          ☉ — bookmark
+          ↑ — pin
+          · — walkable terrain
+          ~ — water
+          ^ — mountain
+          # — road
+        """
+        if self.engine.world_map is None:
+            return Panel(Text("No world map.", style="red"),
+                         title="[bold]Holy Map[/]", border_style="cyan")
+        wm = self.engine.world_map
+        # Pick a downsample factor so the map fits in ~80x30 chars.
+        try:
+            term_w = max(60, min(120, self.console.width))
+            term_h = max(20, min(50, self.console.height))
+        except Exception:  # noqa: BLE001
+            term_w, term_h = 80, 30
+        # Reserve 6 rows for borders / title.
+        avail_w = term_w - 4
+        avail_h = term_h - 6
+        step_x = max(1, (wm.width + avail_w - 1) // avail_w)
+        step_y = max(1, (wm.height + avail_h - 1) // avail_h)
+        # Player position.
+        player_pos = None
+        if self.engine.player is not None:
+            player_pos = self.engine.world.get_component(self.engine.player, Position)
+        # Build a set of settlement coords for quick lookup.
+        settlement_set = {(sx, sy) for sx, sy, _ in self.engine.settlements}
+        settlement_names = {(sx, sy): sname for sx, sy, sname in self.engine.settlements}
+        # Bookmarks / pins / markers.
+        bm = getattr(self.engine, "_bookmarks_mgr", None)
+        marker_set = set()
+        marker_names = {}
+        if bm is not None:
+            for m in bm.all_markers():
+                marker_set.add((m.x, m.y))
+                marker_names[(m.x, m.y)] = m.name
+        # Build the map.
+        from engine.world.terrain import TerrainType
+        lines: list[Text] = []
+        # Top border with column ruler.
+        for j in range(0, wm.height, step_y):
+            row = Text()
+            for i in range(0, wm.width, step_x):
+                # Sample the tile at (i, j).
+                tile = wm.get_tile(i, j)
+                if tile is None:
+                    row.append(" ")
+                    continue
+                # Default to terrain glyph.
+                glyph = "·"
+                style = "dim"
+                if tile.terrain_type in (TerrainType.DEEP_OCEAN, TerrainType.OCEAN,
+                                          TerrainType.SHALLOW_WATER):
+                    glyph = "~"; style = "blue"
+                elif tile.terrain_type in (TerrainType.MOUNTAIN, TerrainType.HIGH_MOUNTAIN):
+                    glyph = "^"; style = "white"
+                elif tile.terrain_type == TerrainType.ROAD:
+                    glyph = "#"; style = "yellow"
+                elif tile.terrain_type == TerrainType.RIVER:
+                    glyph = "~"; style = "cyan"
+                elif tile.terrain_type == TerrainType.BRIDGE:
+                    glyph = "="; style = "yellow"
+                # Settlement overrides terrain.
+                if (i, j) in settlement_set:
+                    glyph = "⌂"; style = "bold yellow"
+                # Markers override settlement glyph if different.
+                if (i, j) in marker_set and (i, j) not in settlement_set:
+                    glyph = "☉"; style = "magenta"
+                # Player always wins.
+                if player_pos is not None and player_pos.x == i and player_pos.y == j:
+                    glyph = "@"; style = "bold green"
+                row.append(glyph, style=style)
+            lines.append(row)
+        # Build the legend / info sidebar.
+        body = Group(*lines)
+        return Panel(body, title=f"[bold cyan]Holy Map — {wm.width}×{wm.height}[/]",
+                     border_style="cyan", expand=True)
+
+    def _render_holymap(self) -> None:
+        """Render the holy map fullscreen — used by _render when _in_holymap."""
+        self.console.clear()
+        self.console.print(self._banner_panel())
+        self.console.print(self._render_holymap_panel())
+        # Show the list of settlements with numbers.
+        if self.engine.settlements:
+            body = Text()
+            body.append("Settlements:\n", style="bold yellow")
+            for i, (sx, sy, sname) in enumerate(self.engine.settlements, 1):
+                body.append(f"  [{i}] {sname} ({sx}, {y})\n" if False else
+                            f"  [{i}] {sname} ({sx}, {sy})\n", style="white")
+            self.console.print(Panel(body, title="[bold]Locations[/]",
+                                     border_style="yellow"))
+        # Show the cursor info if available.
+        if self._holymap_cursor:
+            cx, cy = self._holymap_cursor
+            info = self._holymap_tile_info(cx, cy)
+            self.console.print(Panel(Text(info, style="white"),
+                                     title=f"[bold]Cursor — ({cx}, {cy})[/]",
+                                     border_style="green"))
+        # Player position.
+        if self.engine.player is not None:
+            pos = self.engine.world.get_component(self.engine.player, Position)
+            if pos is not None:
+                self.console.print(f"[bold green]You are at ({pos.x}, {pos.y}).[/]")
+        self.console.print(
+            "[dim]Commands: holymap travel <x> <y> | holymap info <x> <y> | "
+            "holymap settlement <id> | holymap close[/]")
+        self.console.print("[bold green]>[/] ", end="")
 
     def cmd_status(self, args: list[str]) -> None:
         # Status is always visible in the top panel, but we also surface it
@@ -3635,6 +4433,11 @@ class GameREPL:
     # ----- entity lookup --------------------------------------------------- #
 
     def _find_entity_by_name(self, name: str) -> Optional[Entity]:
+        """Find the nearest entity (within 12 tiles) whose name contains `name`.
+        Uses the spatial grid for O(nearby) instead of O(all entities).
+        Falls back to a linear scan if the spatial grid has no nearby
+        entities (e.g., for entities created directly by tests/plugins
+        that don't register in the spatial grid)."""
         if self.engine.player is None:
             return None
         player_pos = self.engine.world.get_component(self.engine.player, Position)
@@ -3642,7 +4445,20 @@ class GameREPL:
             return None
         name_lower = name.lower()
         best: Optional[Entity] = None
-        best_dist = 999
+        best_dist = 999.0
+        # Spatial query — radius 12 covers the player's awareness.
+        for ent, dist in self.engine.spatial.query_radius(player_pos.x, player_pos.y, 12):
+            if ent.id == self.engine.player.id:
+                continue
+            identity = self.engine.world.get_component(ent, Identity)
+            ent_name = identity.display_name if identity else ""
+            if name_lower in ent_name.lower():
+                if dist < best_dist:
+                    best = ent
+                    best_dist = dist
+        if best is not None:
+            return best
+        # Fallback: linear scan (for entities not in the spatial grid).
         for ent, (ep,) in self.engine.world.view(Position):
             if ent.id == self.engine.player.id:
                 continue
@@ -3658,39 +4474,68 @@ class GameREPL:
         return best
 
     def _find_adjacent_hostile(self) -> Optional[Entity]:
+        """Find an adjacent (Chebyshev distance ≤ 1) hostile entity.
+        Uses the spatial grid; falls back to a linear scan."""
         if self.engine.player is None:
             return None
         player_pos = self.engine.world.get_component(self.engine.player, Position)
         if player_pos is None:
             return None
+        for ent, dist in self.engine.spatial.query_radius(player_pos.x, player_pos.y, 1.5):
+            if ent.id == self.engine.player.id:
+                continue
+            if dist > 1.5:
+                continue
+            if self.engine.world.has_tag(ent, "hostile"):
+                return ent
+        # Fallback: linear scan.
         for ent, (ep,) in self.engine.world.view(Position):
             if ent.id == self.engine.player.id:
                 continue
-            dist = max(abs(ep.x - player_pos.x), abs(ep.y - player_pos.y))
-            if dist <= 1 and self.engine.world.has_tag(ent, "hostile"):
-                return ent
+            if max(abs(ep.x - player_pos.x), abs(ep.y - player_pos.y)) <= 1:
+                if self.engine.world.has_tag(ent, "hostile"):
+                    return ent
         return None
 
     def _find_adjacent_npc(self) -> Optional[Entity]:
+        """Find an adjacent NPC. Uses the spatial grid; falls back to a
+        linear scan for backward compatibility."""
         if self.engine.player is None:
             return None
         player_pos = self.engine.world.get_component(self.engine.player, Position)
         if player_pos is None:
             return None
+        for ent, dist in self.engine.spatial.query_radius(player_pos.x, player_pos.y, 1.5):
+            if ent.id == self.engine.player.id:
+                continue
+            if dist > 1.5:
+                continue
+            if self.engine.world.has_tag(ent, "npc"):
+                return ent
+        # Fallback: linear scan.
         for ent, (ep,) in self.engine.world.view(Position):
             if ent.id == self.engine.player.id:
                 continue
-            dist = max(abs(ep.x - player_pos.x), abs(ep.y - player_pos.y))
-            if dist <= 1 and self.engine.world.has_tag(ent, "npc"):
-                return ent
+            if max(abs(ep.x - player_pos.x), abs(ep.y - player_pos.y)) <= 1:
+                if self.engine.world.has_tag(ent, "npc"):
+                    return ent
         return None
 
     def _find_nearest_entity(self, exclude_player: bool = True) -> Optional[Entity]:
+        """Find the nearest entity to the player. Uses the spatial grid;
+        falls back to a linear scan."""
         if self.engine.player is None:
             return None
         player_pos = self.engine.world.get_component(self.engine.player, Position)
         if player_pos is None:
             return None
+        # Use the spatial grid's nearest() helper.
+        results = self.engine.spatial.nearest(player_pos.x, player_pos.y, k=5)
+        for ent, dist in results:
+            if exclude_player and ent.id == self.engine.player.id:
+                continue
+            return ent
+        # Fallback: linear scan.
         best: Optional[Entity] = None
         best_dist = 999
         for ent, (ep,) in self.engine.world.view(Position):
@@ -3782,6 +4627,16 @@ class GameREPL:
         if self._game_over:
             layout = Layout()
             layout.update(self._game_over_panel())
+            return layout
+        # Holy map takes over the whole layout.
+        if self._in_holymap:
+            layout = Layout()
+            layout.update(self._render_holymap_panel())
+            return layout
+        # Encounter panel takes over the whole layout (Mount & Blade 2 style).
+        if self._in_encounter:
+            layout = Layout()
+            layout.update(self._encounter_panel_renderable())
             return layout
 
         layout = Layout()
@@ -4198,10 +5053,14 @@ class GameREPL:
                     # 2b. Detect player death — switch to game-over screen.
                     if getattr(self.engine, "player_dead", False) and not self._game_over:
                         self._game_over = True
+                    # 2c. Check for pending encounter (Mount & Blade 2 style).
+                    if not self._game_over and not self._in_encounter:
+                        self._check_pending_encounter()
                     # 3. Advance the simulation in real time — but pause
                     #    when the player is dead (the world waits for the
-                    #    player to choose respawn / new game / quit).
-                    if not self._game_over:
+                    #    player to choose respawn / new game / quit) OR when
+                    #    the encounter panel is open (player must choose).
+                    if not self._game_over and not self._in_encounter and not self._in_holymap:
                         now = time.perf_counter()
                         if now - self._last_sim_time >= self._sim_dt:
                             try:
@@ -4210,6 +5069,11 @@ class GameREPL:
                                 log.exception("Simulation tick failed")
                                 self.set_output(Text(f"Sim error: {exc}", style="red"),
                                                 title="Error")
+                            # Check for pending encounter after the tick.
+                            self._check_pending_encounter()
+                            # Re-check for game-over.
+                            if getattr(self.engine, "player_dead", False) and not self._game_over:
+                                self._game_over = True
                             # Autosave check.
                             if (self.engine.clock.time.tick - self.engine._last_autosave_tick
                                     >= self.engine.config.save.autosave_interval_ticks):
@@ -4267,6 +5131,10 @@ class GameREPL:
         # Dialogue takes precedence.
         if self._in_dialogue:
             if self._handle_dialogue_input(line):
+                return
+        # Encounter panel takes precedence (Mount & Blade 2 style).
+        if self._in_encounter:
+            if self._handle_encounter_input(line):
                 return
         # Otherwise execute as a command.
         try:
@@ -4356,6 +5224,11 @@ class GameREPL:
         line = line.strip()
         if not line:
             self.engine.tick_simulation(0.05)
+            # Check for pending encounter (move_player sets pending_encounter_id).
+            self._check_pending_encounter()
+            # Check for player death (static-mode game-over detection fix).
+            if getattr(self.engine, "player_dead", False) and not self._game_over:
+                self._game_over = True
             self._render()
             return
         self._history.append(line)
@@ -4363,10 +5236,25 @@ class GameREPL:
         if self._in_dialogue:
             if self._handle_dialogue_input(line):
                 self.engine.tick_simulation(0.05)
+                self._check_pending_encounter()
+                if getattr(self.engine, "player_dead", False) and not self._game_over:
+                    self._game_over = True
+                self._render()
+                return
+        # Encounter panel takes precedence (Mount & Blade 2 style).
+        if self._in_encounter:
+            if self._handle_encounter_input(line):
+                self._check_pending_encounter()
+                if getattr(self.engine, "player_dead", False) and not self._game_over:
+                    self._game_over = True
                 self._render()
                 return
         self._execute_command(line)
         self.engine.tick_simulation(0.05)
+        # Check for pending encounter and game-over after the tick.
+        self._check_pending_encounter()
+        if getattr(self.engine, "player_dead", False) and not self._game_over:
+            self._game_over = True
         # Autosave check.
         if (self.engine.clock.time.tick - self.engine._last_autosave_tick
                 >= self.engine.config.save.autosave_interval_ticks):
@@ -4546,6 +5434,12 @@ class GameREPL:
             "accessibility": "accessibility",
             "keybindings": "keybindings", "keys": "keybindings",
             "locale": "locale", "i18n": "locale",
+            # --- new: Bannerlord-style features ---
+            "give": "give",
+            "autoattack": "autoattack", "aa": "autoattack",
+            "travelto": "travelto", "travel_to": "travelto",
+            "follow": "follow",
+            "holymap": "holymap", "holy": "holymap", "worldmap": "holymap",
         }
 
 
