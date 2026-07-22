@@ -210,6 +210,52 @@ ARCHETYPES: dict[str, BaseItemArchetype] = {
         {"light_radius": 6.0, "burn_time": 600.0},
         "A pitch-soaked torch.",
     ),
+
+    # ---- gift / befriend items ----
+    "bone": BaseItemArchetype(
+        "bone", "bone", "misc", 0.1, 0.1, 1, 999, "‹", 250,
+        False, "organic", ("organic",),
+        {"gift": 1.0},
+        "A polished bone. Skeletons love these.",
+    ),
+    "skull": BaseItemArchetype(
+        "skull", "skull", "misc", 0.3, 0.3, 5, 999, "‹", 250,
+        False, "organic", ("organic",),
+        {"gift": 1.0},
+        "A mortal skull. Undead adore them.",
+    ),
+    "meat": BaseItemArchetype(
+        "meat", "meat", "consumable", 0.3, 0.3, 8, 999, "%", 124,
+        False, "organic", ("organic",),
+        {"food": 35.0, "consumable": 1.0, "gift": 1.0},
+        "A hunk of raw meat. Wolves love it.",
+    ),
+    "cheese": BaseItemArchetype(
+        "cheese", "cheese", "consumable", 0.2, 0.2, 6, 999, "%", 215,
+        False, "organic", ("organic",),
+        {"food": 20.0, "consumable": 1.0, "gift": 1.0},
+        "A wedge of cheese. Rats adore it.",
+    ),
+    "silver_coin": BaseItemArchetype(
+        "silver_coin", "silver coin", "misc", 0.01, 0.001, 100, 999, "$", 250,
+        False, "silver", ("metal",),
+        {"currency": 1.0, "gift": 1.0},
+        "A silver coin (100 cp). Bandits love them.",
+    ),
+}
+
+
+# Gift preferences — what each creature type likes to receive.
+# Used by the `give` command to decide whether giving an item befriends
+# the target. Keyed by creature name (case-insensitive). Value is a set
+# of item base_type strings the creature likes.
+GIFT_PREFERENCES: dict[str, set[str]] = {
+    "skeleton": {"bone", "skull"},
+    "bandit": {"gold_coin", "silver_coin"},
+    "goblin": {"bread", "gold_coin", "silver_coin"},
+    "wolf": {"meat", "bread"},
+    "rat": {"bread", "cheese"},
+    "deer": {"bread"},  # passive — won't be hostile anyway
 }
 
 
